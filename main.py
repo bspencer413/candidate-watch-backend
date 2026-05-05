@@ -114,7 +114,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.3.0")
+app = FastAPI(title="Candidate Watch API", version="0.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +156,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.3.0", "app": "Candidate Watch",
+            "version": "0.3.1", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -363,17 +363,21 @@ def fec_get(path: str, params: dict, timeout: int = 15) -> Optional[dict]:
     url = FEC_BASE + path + "?" + urllib.parse.urlencode(p, doseq=True)
     return fetch_url(url, timeout=timeout)
 
-def fec_search_candidates(name: str, office: str = "S", state: Optional[str] = None,
+def fec_search_candidates(name: Optional[str] = None, office: str = "S",
+                          state: Optional[str] = None, district: Optional[str] = None,
                           cycle: Optional[int] = None, limit: int = 20) -> list:
     params = {
-        "name": name,
         "office": office,
         "per_page": limit,
     }
+    if name:
+        params["name"] = name
     if cycle:
         params["election_year"] = cycle
     if state:
         params["state"] = state
+    if district:
+        params["district"] = district
     data = fec_get("/candidates/", params)
     return (data.get("results", []) or []) if data else []
 
@@ -450,15 +454,21 @@ def congress_cosponsored(bioguide_id: str, limit: int = 10) -> list:
 # == FEC search & profile endpoints ===========================================
 
 @app.get("/fec/search")
-async def fec_search(name: str, office: str = "S", state: Optional[str] = None,
+async def fec_search(name: Optional[str] = None, office: str = "S",
+                     state: Optional[str] = None, district: Optional[str] = None,
                      cycle: Optional[int] = None, limit: int = 20):
-    """Search FEC candidates by name. Default office=S (Senate)."""
+    """Search FEC candidates by name, or by office/state/district (e.g., for ZIP-derived district lookup). Default office=S (Senate)."""
     if not FEC_API_KEY:
         raise HTTPException(status_code=503, detail="FEC_API_KEY not configured")
-    if not name or len(name.strip()) < 2:
-        raise HTTPException(status_code=400, detail="name must be >= 2 chars")
-    results = fec_search_candidates(name.strip(), office=office, state=state,
-                                    cycle=cycle, limit=limit)
+    has_name = bool(name and len(name.strip()) >= 2)
+    has_district = bool(state and district)
+    if not has_name and not has_district:
+        raise HTTPException(status_code=400, detail="provide name (>= 2 chars) or state + district")
+    results = fec_search_candidates(
+        name=name.strip() if has_name else None,
+        office=office, state=state, district=district,
+        cycle=cycle, limit=limit,
+    )
     out = []
     for r in results:
         out.append({

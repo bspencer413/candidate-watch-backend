@@ -1,806 +1,908 @@
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.security import OAuth2PasswordBearer
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from datetime import datetime, timedelta
-from typing import Optional
-import jwt
-import bcrypt
-import psycopg2
-import os
-import urllib.request
-import urllib.parse
-import json as json_lib
-from contextlib import contextmanager
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-# == Config ===================================================================
-
-SECRET_KEY = os.environ.get(“SECRET_KEY”, “candidatewatch-secret-2026”)
-ALGORITHM = “HS256”
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080
-
-# Reuses the MW Postgres but with prefixed tables for full data isolation.
-
-# Set DATABASE_URL in Render env vars to override.
-
-DB_HOST = os.environ.get(“DB_HOST”, “dpg-d6qhp3ngi27c73a3ivag-a.oregon-postgres.render.com”)
-DB_USER = os.environ.get(“DB_USER”, “memorial_watch_db_user”)
-DB_PASS = os.environ.get(“DB_PASS”, “9IkXRdY8NcZSKy0yw5b7viPdtIrVIITR”)
-DB_NAME = os.environ.get(“DB_NAME”, “memorial_watch_db”)
-DATABASE_URL = os.environ.get(“DATABASE_URL”,
-“postgresql://” + DB_USER + “:” + DB_PASS + “@” + DB_HOST + “/” + DB_NAME)
-
-# External API keys
-
-FEC_API_KEY = os.environ.get(“FEC_API_KEY”, “”)
-CONGRESS_API_KEY = os.environ.get(“CONGRESS_API_KEY”, “”)
-
-# == Cycle helpers ============================================================
-
-def current_election_cycle() -> int:
-“”“FEC cycles are even years. 2026, 2028, etc.”””
-y = datetime.utcnow().year
-return y if y % 2 == 0 else y + 1
-
-# == Database =================================================================
-
-def init_db():
-conn = psycopg2.connect(DATABASE_URL)
-c = conn.cursor()
-c.execute(””“CREATE TABLE IF NOT EXISTS cw_users (
-id SERIAL PRIMARY KEY,
-email TEXT UNIQUE NOT NULL,
-password_hash TEXT NOT NULL,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)”””)
-c.execute(””“CREATE TABLE IF NOT EXISTS cw_watchlist (
-id SERIAL PRIMARY KEY,
-user_id INTEGER NOT NULL,
-name TEXT NOT NULL,
-location TEXT,
-dob TEXT,
-status TEXT DEFAULT ‘active’,
-is_memory BOOLEAN DEFAULT FALSE,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-FOREIGN KEY (user_id) REFERENCES cw_users (id)
-)”””)
-c.execute(””“CREATE TABLE IF NOT EXISTS cw_notifications (
-id SERIAL PRIMARY KEY,
-user_id INTEGER NOT NULL,
-watchlist_id INTEGER NOT NULL,
-message TEXT NOT NULL,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-FOREIGN KEY (user_id) REFERENCES cw_users (id),
-FOREIGN KEY (watchlist_id) REFERENCES cw_watchlist (id)
-)”””)
-c.execute(””“CREATE TABLE IF NOT EXISTS cw_snapshots (
-watchlist_id INTEGER PRIMARY KEY,
-snapshot_json TEXT NOT NULL,
-captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-FOREIGN KEY (watchlist_id) REFERENCES cw_watchlist (id)
-)”””)
-conn.commit()
-conn.close()
-
-@contextmanager
-def get_db():
-conn = psycopg2.connect(DATABASE_URL)
-conn.autocommit = False
-try:
-yield conn
-finally:
-conn.close()
-
-# == Models ===================================================================
-
-class UserCreate(BaseModel):
-email: EmailStr
-password: str
-
-class UserLogin(BaseModel):
-email: EmailStr
-password: str
-
-class Token(BaseModel):
-access_token: str
-token_type: str
-
-class WatchlistItem(BaseModel):
-name: str
-location: Optional[str] = None
-dob: Optional[str] = None
-
-# == App ======================================================================
-
-app = FastAPI(title=“Candidate Watch API”, version=“0.2.0”)
-
-app.add_middleware(
-CORSMiddleware,
-allow_origins=[”*”],
-allow_credentials=True,
-allow_methods=[”*”],
-allow_headers=[”*”],
-)
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=“auth/login”)
-
-# == Auth helpers =============================================================
-
-def hash_password(p: str) -> str:
-return bcrypt.hashpw(p.encode(“utf-8”), bcrypt.gensalt()).decode(“utf-8”)
-
-def verify_password(p: str, h: str) -> bool:
-return bcrypt.checkpw(p.encode(“utf-8”), h.encode(“utf-8”))
-
-def create_access_token(data: dict) -> str:
-to_encode = data.copy()
-to_encode.update({“exp”: datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)})
-return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-try:
-payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-user_id = payload.get(“sub”)
-if user_id is None:
-raise HTTPException(status_code=401, detail=“Invalid authentication”)
-return int(user_id)
-except jwt.ExpiredSignatureError:
-raise HTTPException(status_code=401, detail=“Token expired”)
-except jwt.InvalidTokenError:
-raise HTTPException(status_code=401, detail=“Invalid token”)
-
-# == Health ===================================================================
-
-@app.api_route(”/health”, methods=[“GET”, “HEAD”])
-async def health_check():
-return {“status”: “healthy”, “timestamp”: datetime.now().isoformat(),
-“version”: “0.2.0”, “app”: “Candidate Watch”,
-“fec_configured”: bool(FEC_API_KEY),
-“congress_configured”: bool(CONGRESS_API_KEY),
-“cycle”: current_election_cycle()}
-
-# == Auth =====================================================================
-
-@app.post(”/auth/register”, response_model=Token)
-async def register(user: UserCreate):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(“SELECT id FROM cw_users WHERE email = %s”, (user.email,))
-if c.fetchone():
-raise HTTPException(status_code=400, detail=“Email already registered”)
-c.execute(“INSERT INTO cw_users (email, password_hash) VALUES (%s, %s) RETURNING id”,
-(user.email, hash_password(user.password)))
-user_id = c.fetchone()[0]
-conn.commit()
-return {“access_token”: create_access_token({“sub”: str(user_id)}), “token_type”: “bearer”}
-
-@app.post(”/auth/login”, response_model=Token)
-async def login(user: UserLogin):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(“SELECT id, password_hash FROM cw_users WHERE email = %s”, (user.email,))
-result = c.fetchone()
-if not result or not verify_password(user.password, result[1]):
-raise HTTPException(status_code=401, detail=“Invalid credentials”)
-return {“access_token”: create_access_token({“sub”: str(result[0])}), “token_type”: “bearer”}
-
-@app.delete(”/account”)
-async def delete_account(user_id: int = Depends(get_current_user)):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(””“DELETE FROM cw_snapshots WHERE watchlist_id IN
-(SELECT id FROM cw_watchlist WHERE user_id = %s)”””, (user_id,))
-c.execute(“DELETE FROM cw_notifications WHERE user_id = %s”, (user_id,))
-c.execute(“DELETE FROM cw_watchlist WHERE user_id = %s”, (user_id,))
-c.execute(“DELETE FROM cw_users WHERE id = %s”, (user_id,))
-conn.commit()
-return {“message”: “Account permanently deleted”}
-
-# == Watchlist ================================================================
-
-@app.get(”/watchlist”)
-async def get_watchlist(user_id: int = Depends(get_current_user)):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(””“SELECT id, name, location, dob, status, created_at, is_memory
-FROM cw_watchlist WHERE user_id = %s AND status = ‘active’
-ORDER BY created_at DESC”””, (user_id,))
-return [{“id”: r[0], “name”: r[1], “location”: r[2], “dob”: r[3],
-“status”: r[4], “created_at”: str(r[5]),
-“is_memory”: r[6] or False}
-for r in c.fetchall()]
-
-@app.post(”/watchlist”)
-async def add_to_watchlist(item: WatchlistItem, user_id: int = Depends(get_current_user)):
-with get_db() as conn:
-c = conn.cursor()
-# Reject duplicates within same user
-c.execute(””“SELECT id FROM cw_watchlist
-WHERE user_id = %s AND status = ‘active’ AND LOWER(name) = LOWER(%s)”””,
-(user_id, item.name))
-if c.fetchone():
-raise HTTPException(status_code=400, detail=item.name + “ is already on your watchlist”)
-c.execute(””“INSERT INTO cw_watchlist (user_id, name, location, dob)
-VALUES (%s, %s, %s, %s) RETURNING id”””,
-(user_id, item.name, item.location, item.dob))
-new_id = c.fetchone()[0]
-conn.commit()
-
-```
-# Seed snapshot from FEC if we have a fecId in the meta
-snap = build_alert_snapshot(item.location)
-if snap is not None:
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("""INSERT INTO cw_snapshots (watchlist_id, snapshot_json, captured_at)
-                     VALUES (%s, %s, CURRENT_TIMESTAMP)
-                     ON CONFLICT (watchlist_id) DO UPDATE
-                     SET snapshot_json = EXCLUDED.snapshot_json,
-                         captured_at = CURRENT_TIMESTAMP""",
-                  (new_id, json_lib.dumps(snap)))
-        conn.commit()
-
-return {"id": new_id, "name": item.name, "location": item.location, "dob": item.dob}
-```
-
-@app.delete(”/watchlist/{item_id}”)
-async def remove_from_watchlist(item_id: int, user_id: int = Depends(get_current_user)):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(“UPDATE cw_watchlist SET status = ‘deleted’ WHERE id = %s AND user_id = %s”,
-(item_id, user_id))
-if c.rowcount == 0:
-conn.rollback()
-raise HTTPException(status_code=404, detail=“Item not found”)
-c.execute(“DELETE FROM cw_snapshots WHERE watchlist_id = %s”, (item_id,))
-conn.commit()
-return {“message”: “Removed”}
-
-@app.get(”/watchlist/{item_id}/refresh”)
-async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_current_user)):
-“”“Manual on-demand refresh of a single watchlist item.
-Re-fetches FEC, diffs against snapshot, writes any alerts, updates snapshot.”””
-with get_db() as conn:
-c = conn.cursor()
-c.execute(””“SELECT id, location FROM cw_watchlist
-WHERE id = %s AND user_id = %s AND status = ‘active’”””,
-(item_id, user_id))
-row = c.fetchone()
-if not row:
-raise HTTPException(status_code=404, detail=“Not found”)
-new_snap = build_alert_snapshot(row[1])
-if new_snap is None:
-return {“changed”: False, “reason”: “No FEC id linked or fetch failed”}
-
-```
-# Read prior, diff, write alerts, upsert snapshot
-with get_db() as conn:
-    c = conn.cursor()
-    c.execute("SELECT snapshot_json FROM cw_snapshots WHERE watchlist_id = %s", (item_id,))
-    prior = c.fetchone()
-old_snap = None
-if prior and prior[0]:
-    try:
-        old_snap = json_lib.loads(prior[0])
-    except Exception:
-        old_snap = None
-
-alerts = diff_snapshots(old_snap, new_snap)
-with get_db() as conn:
-    c = conn.cursor()
-    for msg in alerts:
-        c.execute("""INSERT INTO cw_notifications (user_id, watchlist_id, message)
-                     VALUES (%s, %s, %s)""", (user_id, item_id, msg))
-    c.execute("""INSERT INTO cw_snapshots (watchlist_id, snapshot_json, captured_at)
-                 VALUES (%s, %s, CURRENT_TIMESTAMP)
-                 ON CONFLICT (watchlist_id) DO UPDATE
-                 SET snapshot_json = EXCLUDED.snapshot_json,
-                     captured_at = CURRENT_TIMESTAMP""",
-              (item_id, json_lib.dumps(new_snap)))
-    conn.commit()
-
-return {"changed": len(alerts) > 0, "alerts": alerts, "snapshot": new_snap}
-```
-
-# == Notifications ============================================================
-
-@app.get(”/notifications”)
-async def get_notifications(user_id: int = Depends(get_current_user)):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(””“SELECT n.id, n.message, n.created_at, w.name, n.watchlist_id
-FROM cw_notifications n
-JOIN cw_watchlist w ON n.watchlist_id = w.id
-WHERE n.user_id = %s
-ORDER BY n.created_at DESC LIMIT 50”””, (user_id,))
-return [{“id”: r[0], “name”: r[3], “message”: r[1],
-“created_at”: str(r[2]), “watchlist_id”: r[4]}
-for r in c.fetchall()]
-
-@app.delete(”/notifications/{notif_id}”)
-async def delete_notification(notif_id: int, user_id: int = Depends(get_current_user)):
-with get_db() as conn:
-c = conn.cursor()
-c.execute(“DELETE FROM cw_notifications WHERE id = %s AND user_id = %s”,
-(notif_id, user_id))
-conn.commit()
-return {“deleted”: True}
-
-# == FEC OpenAPI client =======================================================
-
-FEC_BASE = “https://api.open.fec.gov/v1”
-
-def fetch_url(url: str, timeout: int = 15):
-try:
-req = urllib.request.Request(url, headers={
-“User-Agent”: “CandidateWatch/0.2 (+https://candidatewatch.app)”,
-“Accept”: “application/json, text/plain, */*”,
-})
-with urllib.request.urlopen(req, timeout=timeout) as resp:
-return json_lib.loads(resp.read().decode())
-except Exception as e:
-print(”[fetch] error “ + url + “: “ + str(e))
-return None
-
-def fec_get(path: str, params: dict, timeout: int = 15) -> Optional[dict]:
-if not FEC_API_KEY:
-return None
-p = dict(params or {})
-p[“api_key”] = FEC_API_KEY
-url = FEC_BASE + path + “?” + urllib.parse.urlencode(p, doseq=True)
-return fetch_url(url, timeout=timeout)
-
-def fec_search_candidates(name: str, office: str = “S”, state: Optional[str] = None,
-cycle: Optional[int] = None, limit: int = 20) -> list:
-cycle = cycle or current_election_cycle()
-params = {
-“q”: name,
-“office”: office,
-“election_year”: cycle,
-“candidate_status”: “C”,
-“per_page”: limit,
-“sort”: “-receipts”,
-}
-if state:
-params[“state”] = state
-data = fec_get(”/candidates/search/”, params)
-return (data.get(“results”, []) or []) if data else []
-
-def fec_candidate_detail(candidate_id: str, cycle: Optional[int] = None) -> dict:
-cycle = cycle or current_election_cycle()
-data = fec_get(”/candidate/” + candidate_id + “/”, {“cycle”: cycle})
-if not data:
-return {}
-results = data.get(“results”, []) or []
-return results[0] if results else {}
-
-def fec_candidate_totals(candidate_id: str, cycle: Optional[int] = None) -> dict:
-cycle = cycle or current_election_cycle()
-data = fec_get(”/candidate/” + candidate_id + “/totals/”,
-{“cycle”: cycle, “election_full”: “true”, “per_page”: 1})
-if not data:
-return {}
-results = data.get(“results”, []) or []
-return results[0] if results else {}
-
-def fec_principal_committee(candidate_id: str, cycle: Optional[int] = None) -> dict:
-cycle = cycle or current_election_cycle()
-data = fec_get(”/candidate/” + candidate_id + “/committees/”,
-{“cycle”: cycle, “designation”: “P”, “per_page”: 1})
-if not data:
-return {}
-results = data.get(“results”, []) or []
-return results[0] if results else {}
-
-def fec_committee_filings(committee_id: str, cycle: Optional[int] = None, limit: int = 5) -> list:
-cycle = cycle or current_election_cycle()
-data = fec_get(”/committee/” + committee_id + “/filings/”,
-{“cycle”: cycle, “per_page”: limit, “sort”: “-receipt_date”})
-return (data.get(“results”, []) or []) if data else []
-
-def fec_candidates_by_state(office: str, state: str, cycle: Optional[int] = None) -> list:
-cycle = cycle or current_election_cycle()
-params = {
-“office”: office,
-“state”: state,
-“election_year”: cycle,
-“candidate_status”: “C”,
-“per_page”: 50,
-“sort”: “-receipts”,
-}
-data = fec_get(”/candidates/search/”, params)
-return (data.get(“results”, []) or []) if data else []
-
-# == Congress.gov client ======================================================
-
-CONGRESS_BASE = “https://api.congress.gov/v3”
-
-def congress_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> Optional[dict]:
-if not CONGRESS_API_KEY:
-return None
-p = dict(params or {})
-p[“api_key”] = CONGRESS_API_KEY
-p.setdefault(“format”, “json”)
-url = CONGRESS_BASE + path + “?” + urllib.parse.urlencode(p, doseq=True)
-return fetch_url(url, timeout=timeout)
-
-def congress_member(bioguide_id: str) -> dict:
-data = congress_get(”/member/” + bioguide_id, {})
-return (data.get(“member”) or {}) if data else {}
-
-def congress_sponsored(bioguide_id: str, limit: int = 10) -> list:
-data = congress_get(”/member/” + bioguide_id + “/sponsored-legislation”,
-{“limit”: limit})
-return (data.get(“sponsoredLegislation”) or []) if data else []
-
-def congress_cosponsored(bioguide_id: str, limit: int = 10) -> list:
-data = congress_get(”/member/” + bioguide_id + “/cosponsored-legislation”,
-{“limit”: limit})
-return (data.get(“cosponsoredLegislation”) or []) if data else []
-
-# == FEC search & profile endpoints ===========================================
-
-@app.get(”/fec/search”)
-async def fec_search(name: str, office: str = “S”, state: Optional[str] = None,
-cycle: Optional[int] = None, limit: int = 20):
-“”“Search FEC candidates by name. Default office=S (Senate).”””
-if not FEC_API_KEY:
-raise HTTPException(status_code=503, detail=“FEC_API_KEY not configured”)
-if not name or len(name.strip()) < 2:
-raise HTTPException(status_code=400, detail=“name must be >= 2 chars”)
-results = fec_search_candidates(name.strip(), office=office, state=state,
-cycle=cycle, limit=limit)
-out = []
-for r in results:
-out.append({
-“candidate_id”: r.get(“candidate_id”),
-“name”: r.get(“name”),
-“party”: r.get(“party_full”) or r.get(“party”),
-“office”: r.get(“office_full”) or r.get(“office”),
-“state”: r.get(“state”),
-“district”: r.get(“district”),
-“incumbent_challenge”: r.get(“incumbent_challenge_full”) or r.get(“incumbent_challenge”),
-“cycle”: (r.get(“election_years”) or [None])[-1] if r.get(“election_years”) else None,
-“principal_committee”: (r.get(“principal_committees”) or [{}])[0].get(“committee_id”) if r.get(“principal_committees”) else None,
-})
-return {“results”: out, “cycle”: cycle or current_election_cycle()}
-
-@app.get(”/fec/candidate/{candidate_id}”)
-async def fec_candidate(candidate_id: str, cycle: Optional[int] = None):
-“”“Full candidate profile: bio, totals, principal committee, recent filings.”””
-if not FEC_API_KEY:
-raise HTTPException(status_code=503, detail=“FEC_API_KEY not configured”)
-cycle = cycle or current_election_cycle()
-detail = fec_candidate_detail(candidate_id, cycle=cycle)
-if not detail:
-raise HTTPException(status_code=404, detail=“Candidate not found”)
-totals = fec_candidate_totals(candidate_id, cycle=cycle) or {}
-pc = fec_principal_committee(candidate_id, cycle=cycle) or {}
-filings = []
-if pc.get(“committee_id”):
-filings = fec_committee_filings(pc[“committee_id”], cycle=cycle, limit=5) or []
-return {
-“candidate”: {
-“candidate_id”: detail.get(“candidate_id”),
-“name”: detail.get(“name”),
-“party”: detail.get(“party_full”) or detail.get(“party”),
-“office”: detail.get(“office_full”) or detail.get(“office”),
-“state”: detail.get(“state”),
-“district”: detail.get(“district”),
-“incumbent_challenge”: detail.get(“incumbent_challenge_full”),
-“active_through”: detail.get(“active_through”),
-},
-“totals”: {
-“cycle”: cycle,
-“receipts”: totals.get(“receipts”),
-“disbursements”: totals.get(“disbursements”),
-“cash_on_hand_end_period”: totals.get(“cash_on_hand_end_period”),
-“debts_owed_by_committee”: totals.get(“debts_owed_by_committee”),
-“individual_contributions”: totals.get(“individual_contributions”),
-“other_political_committee_contributions”: totals.get(“other_political_committee_contributions”),
-“coverage_end_date”: totals.get(“coverage_end_date”),
-},
-“principal_committee”: {
-“committee_id”: pc.get(“committee_id”),
-“name”: pc.get(“name”),
-} if pc else None,
-“recent_filings”: [
-{
-“filing_id”: f.get(“file_number”) or f.get(“sub_id”),
-“form_type”: f.get(“form_type”),
-“receipt_date”: f.get(“receipt_date”),
-“coverage_end_date”: f.get(“coverage_end_date”),
-“total_receipts_period”: f.get(“total_receipts_period”),
-“total_disbursements_period”: f.get(“total_disbursements_period”),
-}
-for f in filings
-],
-}
-
-@app.get(”/fec/race”)
-async def fec_race(office: str, state: str, district: Optional[str] = None,
-cycle: Optional[int] = None):
-“”“All candidates in a given race (Senate state, House state+district).”””
-if not FEC_API_KEY:
-raise HTTPException(status_code=503, detail=“FEC_API_KEY not configured”)
-if office.upper() not in (“S”, “H”):
-raise HTTPException(status_code=400, detail=“office must be S or H”)
-cycle = cycle or current_election_cycle()
-results = fec_candidates_by_state(office.upper(), state.upper(), cycle=cycle)
-if office.upper() == “H” and district:
-results = [r for r in results if str(r.get(“district”) or “”) == str(district).zfill(2)]
-out = []
-for r in results:
-out.append({
-“candidate_id”: r.get(“candidate_id”),
-“name”: r.get(“name”),
-“party”: r.get(“party_full”) or r.get(“party”),
-“incumbent_challenge”: r.get(“incumbent_challenge_full”) or r.get(“incumbent_challenge”),
-“state”: r.get(“state”),
-“district”: r.get(“district”),
-“principal_committee”: (r.get(“principal_committees”) or [{}])[0].get(“committee_id”) if r.get(“principal_committees”) else None,
-})
-return {“office”: office.upper(), “state”: state.upper(),
-“district”: district, “cycle”: cycle, “candidates”: out}
-
-# == Congress.gov endpoints (incumbents) ======================================
-
-@app.get(”/congress/member/{bioguide_id}”)
-async def congress_member_endpoint(bioguide_id: str):
-“”“Bio + recent sponsored/cosponsored legislation for an incumbent.”””
-if not CONGRESS_API_KEY:
-raise HTTPException(status_code=503, detail=“CONGRESS_API_KEY not configured”)
-bio = congress_member(bioguide_id) or {}
-sponsored = congress_sponsored(bioguide_id, limit=10) or []
-cosponsored = congress_cosponsored(bioguide_id, limit=10) or []
-return {
-“member”: {
-“bioguide_id”: bio.get(“bioguideId”) or bioguide_id,
-“name”: bio.get(“directOrderName”) or bio.get(“invertedOrderName”),
-“state”: bio.get(“state”),
-“party”: (bio.get(“partyHistory”) or [{}])[-1].get(“partyName”) if bio.get(“partyHistory”) else bio.get(“partyName”),
-“depiction”: bio.get(“depiction”) or {},
-“terms”: bio.get(“terms”) or [],
-“honorific”: bio.get(“honorificName”),
-},
-“sponsored”: [
-{
-“title”: b.get(“title”),
-“type”: b.get(“type”),
-“number”: b.get(“number”),
-“introduced_date”: b.get(“introducedDate”),
-“latest_action”: (b.get(“latestAction”) or {}).get(“text”),
-“latest_action_date”: (b.get(“latestAction”) or {}).get(“actionDate”),
-}
-for b in sponsored
-],
-“cosponsored”: [
-{
-“title”: b.get(“title”),
-“type”: b.get(“type”),
-“number”: b.get(“number”),
-“introduced_date”: b.get(“introducedDate”),
-}
-for b in cosponsored
-],
-}
-
-# == Snapshot + diff (cron core) ==============================================
-
-def build_alert_snapshot(meta_json):
-“”“Fetch FEC + Congress data for a watched candidate. Return a small
-alert-relevant snapshot. Returns None if we can’t reach FEC or meta is missing.”””
-if not meta_json:
-return None
-try:
-meta = json_lib.loads(meta_json)
-except Exception:
-return None
-fec_id = meta.get(“fecId”) or meta.get(“candidate_id”)
-if not fec_id:
-return None
-
-```
-cycle = current_election_cycle()
-detail = fec_candidate_detail(fec_id, cycle=cycle) or {}
-totals = fec_candidate_totals(fec_id, cycle=cycle) or {}
-pc = fec_principal_committee(fec_id, cycle=cycle) or {}
-
-last_filing_id = ""
-last_filing_date = ""
-if pc.get("committee_id"):
-    fls = fec_committee_filings(pc["committee_id"], cycle=cycle, limit=1) or []
-    if fls:
-        last_filing_id = str(fls[0].get("file_number") or fls[0].get("sub_id") or "")
-        last_filing_date = str(fls[0].get("receipt_date") or "")
-
-snap = {
-    "candidate_id": fec_id,
-    "cycle": cycle,
-    "incumbent_challenge": (detail.get("incumbent_challenge_full") or "").strip(),
-    "last_filing_id": last_filing_id,
-    "last_filing_date": last_filing_date,
-    "receipts": totals.get("receipts"),
-    "disbursements": totals.get("disbursements"),
-    "cash_on_hand": totals.get("cash_on_hand_end_period"),
-    "debts": totals.get("debts_owed_by_committee"),
-}
-
-# For incumbents with a bioguideId, capture latest sponsored bill
-bio_id = meta.get("bioguideId")
-is_incumbent = (snap["incumbent_challenge"] or "").lower().find("incumbent") >= 0
-if is_incumbent and bio_id and CONGRESS_API_KEY:
-    sp = congress_sponsored(bio_id, limit=1) or []
-    if sp:
-        b = sp[0]
-        snap["latest_bill"] = {
-            "type": b.get("type") or "",
-            "number": str(b.get("number") or ""),
-            "title": (b.get("title") or "")[:200],
-            "introduced_date": b.get("introducedDate") or "",
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#1B3A57">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Candidate Watch">
+  <title>Candidate Watch</title>
+  <meta name="description" content="Candidate Watch -- Track Senate candidates. Add any candidate to your watchlist. Get notified on new FEC filings, fundraising changes, and key votes.">
+  <meta name="keywords" content="candidate watch, FEC, Senate, election, campaign finance, congressional voting record">
+  <meta name="robots" content="index, follow">
+  <meta name="author" content="Candidate Watch">
+  <link rel="canonical" href="https://candidatewatch.app">
+  <meta property="og:title" content="Candidate Watch -- Track Senate Candidates.">
+  <meta property="og:description" content="Add any candidate to your watchlist. Get notified on new filings and key votes.">
+  <meta property="og:url" content="https://candidatewatch.app">
+  <meta property="og:type" content="website">
+  <link rel="manifest" href="data:application/json;base64,eyJuYW1lIjogIkNhbmRpZGF0ZSBXYXRjaCIsICJzaG9ydF9uYW1lIjogIkNXIiwgInN0YXJ0X3VybCI6ICIvIiwgImRpc3BsYXkiOiAic3RhbmRhbG9uZSIsICJiYWNrZ3JvdW5kX2NvbG9yIjogIiMwRDFCMkEiLCAidGhlbWVfY29sb3IiOiAiIzFCM0E1NyJ9">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Graduate&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    /* SKIN CSS VARS -- reskinner v0.3 will target these */
+    :root {
+      --cw-accent: #1B3A57;
+      --cw-accent-2: #B8941F;
+      --cw-bg-gradient: linear-gradient(135deg, #0D1B2A 0%, #1B3A57 50%, #2A4A6B 100%);
+      --cw-bg-overlay: rgba(0,0,0,0.50);
+      --cw-signin-blur: blur(2px);
+      --cw-card-bg: rgba(0,0,0,0.55);
+      --cw-card-border: rgba(255,255,255,0.15);
+      --cw-drawer-bg: #0a0f1e;
+      --cw-display-font: 'Graduate', Georgia, serif;
+    }
+    * { -webkit-tap-highlight-color: transparent; font-family: Georgia, 'Times New Roman', serif; }
+    html, body { height: 100%; overflow-x: hidden; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .modal-drawer {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+      background: var(--cw-drawer-bg); border-radius: 20px 20px 0 0;
+      border-top: 1px solid var(--cw-card-border);
+      max-height: 85vh; overflow-y: auto;
+      transform: translateY(0); transition: transform 0.3s ease;
+      padding-bottom: max(1rem, env(safe-area-inset-bottom));
+    }
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 99; }
+    .page-bg {
+      min-height: 100dvh; width: 100%;
+      background: var(--cw-bg-gradient);
+      background-attachment: scroll; background-size: cover;
+      position: relative;
+    }
+    .page-bg::before {
+      content: ''; position: absolute; inset: 0;
+      background: var(--cw-bg-overlay); pointer-events: none;
+    }
+  </style>
+</head>
+<body style="margin:0; background: #0D1B2A;">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+// == Constants ================================================================
+const APP_NAME = 'Candidate Watch';
+const APP_VERSION = '0.2.0';
+const API_BASE = 'https://candidate-watch-backend.onrender.com';
+const CW_REPO = 'https://raw.githubusercontent.com/bspencer413/candidate-watch/main';
+const SIGNIN_BG = CW_REPO + '/signin-background.jpg';
+const BILL_PHOTO = 'https://raw.githubusercontent.com/bspencer413/memorial-watch/main/Bill.jpeg';
+const TAGLINE = 'Who are you watching?';
+const TAGLINE_SUB = 'Track Senate candidates across the country';
+
+const isPhone = window.innerWidth < 500;
+const isTablet = window.innerWidth >= 500 && window.innerWidth < 1024;
+const PT = isPhone ? '36vh' : isTablet ? '40vh' : '38vh';
+
+// == Helpers ==================================================================
+const toTitleCase = (s) => s ? s.replace(/\w\S*/g, t => t.charAt(0).toUpperCase() + t.substr(1).toLowerCase()).replace(/'\w/g, t => t.toUpperCase()) : s;
+const smartTitleCase = (s) => s ? s.trim().replace(/\s+/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ') : s;
+const fmtMoney = (n) => {
+  if (n === null || n === undefined || isNaN(n)) return '--';
+  const v = Number(n);
+  if (Math.abs(v) >= 1e6) return '$' + (v/1e6).toFixed(2) + 'M';
+  if (Math.abs(v) >= 1e3) return '$' + (v/1e3).toFixed(1) + 'K';
+  return '$' + v.toFixed(0);
+};
+const fmtDate = (s) => { if (!s) return ''; try { return new Date(s).toLocaleDateString(); } catch(e) { return s; } };
+
+// == Snapshot store (per-candidate, in localStorage) ==========================
+const SNAPSHOT_KEY = (id) => 'cw_stats_' + id;
+const saveStatSnapshot = (id, snap) => { if (!id || !snap) return; try { localStorage.setItem(SNAPSHOT_KEY(id), JSON.stringify(snap)); } catch(e) {} };
+const getStatSnapshot = (id) => { if (!id) return null; try { const raw = localStorage.getItem(SNAPSHOT_KEY(id)); return raw ? JSON.parse(raw) : null; } catch(e) { return null; } };
+const deleteStatSnapshot = (id) => { if (!id) return; try { localStorage.removeItem(SNAPSHOT_KEY(id)); } catch(e) {} };
+
+const buildSnapshot = (profile, congress) => {
+  // profile = response from /fec/candidate/{id}
+  // congress = response from /congress/member/{bioguide} (optional)
+  if (!profile || !profile.candidate) return null;
+  return {
+    capturedAt: new Date().toISOString(),
+    candidate: profile.candidate,
+    totals: profile.totals || {},
+    principalCommittee: profile.principal_committee || null,
+    recentFilings: profile.recent_filings || [],
+    congress: congress || null,
+  };
+};
+
+const snapshotChanged = (oldSnap, newSnap) => {
+  if (!oldSnap || !newSnap) return !!(oldSnap || newSnap);
+  const oldF = (oldSnap.recentFilings || [])[0] || {};
+  const newF = (newSnap.recentFilings || [])[0] || {};
+  if ((oldF.filing_id || '') !== (newF.filing_id || '')) return true;
+  // Also detect a vote/bill diff for incumbents
+  const oldB = oldSnap.congress && (oldSnap.congress.sponsored || [])[0];
+  const newB = newSnap.congress && (newSnap.congress.sponsored || [])[0];
+  if ((oldB && oldB.number) !== (newB && newB.number)) return true;
+  return false;
+};
+
+// == API fetchers =============================================================
+const fetchFecSearch = async (name, office, state) => {
+  try {
+    let url = API_BASE + '/fec/search?name=' + encodeURIComponent(name) + '&office=' + encodeURIComponent(office || 'S');
+    if (state) url += '&state=' + encodeURIComponent(state);
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const data = await r.json();
+    return (data && data.results) || [];
+  } catch(e) { return []; }
+};
+
+const fetchFecCandidate = async (candidateId) => {
+  try {
+    const r = await fetch(API_BASE + '/fec/candidate/' + encodeURIComponent(candidateId));
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+};
+
+const fetchCongressMember = async (bioguideId) => {
+  try {
+    const r = await fetch(API_BASE + '/congress/member/' + encodeURIComponent(bioguideId));
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+};
+
+const fetchWikiBio = async (name) => {
+  try {
+    const sum = await (await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(name))).json();
+    if (sum && sum.title && sum.extract) return sum;
+    return null;
+  } catch(e) { return null; }
+};
+
+// == Icons ====================================================================
+const SearchIcon = () => (<svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>);
+const HeartIcon = () => (<svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" /></svg>);
+const InfoIcon = () => (<svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+const BellIcon = ({ red }) => (<svg className="w-7 h-7" fill="none" stroke={red ? 'var(--cw-accent-2)' : 'currentColor'} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>);
+const PlusIcon = () => (<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>);
+const TrashIcon = () => (<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>);
+const CheckIcon = () => (<svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>);
+const RefreshIcon = () => (<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>);
+const EyeIcon = () => (<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>);
+const EyeOffIcon = () => (<svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>);
+
+// == Reusable bits ============================================================
+const ClearableInput = ({ value, onChange, onBlur, onKeyPress, placeholder, type='text', maxLength, inputClass }) => (
+  <input type={type} value={value || ''} onChange={onChange} onBlur={onBlur} onKeyPress={onKeyPress}
+    placeholder={placeholder} maxLength={maxLength} className={inputClass} />
+);
+
+const CardPageHeader = ({ title, subtitle }) => (
+  <div className="text-center pb-2 mb-3 border-b border-white/15">
+    <h2 className="text-4xl font-black text-white" style={{ fontFamily: 'var(--cw-display-font)', letterSpacing: '0.06em', textTransform: 'uppercase', WebkitTextStroke: '1px #fff' }}>{title}</h2>
+    {subtitle && <p className="text-white/70 text-xl italic mt-1">{subtitle}</p>}
+  </div>
+);
+
+const PageWrapper = ({ children }) => (
+  <div className="page-bg">
+    <div style={{ position: 'relative', zIndex: 2, paddingBottom: 'calc(5.5rem + env(safe-area-inset-bottom))' }}>{children}</div>
+  </div>
+);
+
+const partyColor = (party) => {
+  const p = (party || '').toUpperCase();
+  if (p.indexOf('DEM') === 0 || p === 'D') return '#3B82F6';
+  if (p.indexOf('REP') === 0 || p === 'R') return '#EF4444';
+  if (p.indexOf('IND') === 0 || p === 'I') return '#A78BFA';
+  if (p.indexOf('LIB') === 0) return '#FBBF24';
+  if (p.indexOf('GRE') === 0) return '#22C55E';
+  return '#9CA3AF';
+};
+
+const partyAbbrev = (party) => {
+  if (!party) return '';
+  const p = party.toUpperCase();
+  if (p.indexOf('DEM') === 0) return 'D';
+  if (p.indexOf('REP') === 0) return 'R';
+  if (p.indexOf('IND') === 0) return 'I';
+  if (p.indexOf('LIB') === 0) return 'LIB';
+  if (p.indexOf('GRE') === 0) return 'GRE';
+  return p.slice(0, 3);
+};
+
+const officeLabel = (office, state, district) => {
+  const o = (office || '').toUpperCase();
+  if (o === 'S' || o === 'SENATE') return state ? state.toUpperCase() + ' Senate' : 'Senate';
+  if (o === 'H' || o === 'HOUSE') {
+    const d = district ? String(district).replace(/^0+/, '') || '00' : '';
+    return state ? (state.toUpperCase() + (d ? '-' + d : '') + ' House') : 'House';
+  }
+  if (o === 'P') return 'Presidential';
+  return office || '';
+};
+
+// == StatPanel: shows finance + voting record from snapshot ===================
+const StatPanel = ({ snapshot }) => {
+  if (!snapshot) return <p className="text-gray-300 text-xl text-center">No data captured yet.</p>;
+  const t = snapshot.totals || {};
+  const filings = snapshot.recentFilings || [];
+  const cong = snapshot.congress || {};
+  const sponsored = (cong && cong.sponsored) || [];
+  const cand = snapshot.candidate || {};
+  const incumbent = (cand.incumbent_challenge || '').toLowerCase().indexOf('incumbent') >= 0;
+
+  return (
+    <div className="space-y-3">
+      {/* Money block */}
+      <div className="bg-black/40 border border-white/15 rounded-xl p-4">
+        <h4 className="text-white text-2xl font-bold mb-2" style={{ fontFamily: 'var(--cw-display-font)' }}>CAMPAIGN FINANCE</h4>
+        <p className="text-white/60 text-sm mb-3">Cycle {t.cycle || ''} {t.coverage_end_date ? '-- through ' + fmtDate(t.coverage_end_date) : ''}</p>
+        <div className="grid grid-cols-2 gap-3">
+          <div><p className="text-white/60 text-base">Raised</p><p className="text-white text-2xl font-bold">{fmtMoney(t.receipts)}</p></div>
+          <div><p className="text-white/60 text-base">Spent</p><p className="text-white text-2xl font-bold">{fmtMoney(t.disbursements)}</p></div>
+          <div><p className="text-white/60 text-base">Cash on Hand</p><p className="text-white text-2xl font-bold" style={{ color: 'var(--cw-accent-2)' }}>{fmtMoney(t.cash_on_hand_end_period)}</p></div>
+          <div><p className="text-white/60 text-base">Debt</p><p className="text-white text-2xl font-bold">{fmtMoney(t.debts_owed_by_committee)}</p></div>
+        </div>
+      </div>
+
+      {/* Recent filings */}
+      {filings.length > 0 && (
+        <div className="bg-black/40 border border-white/15 rounded-xl p-4">
+          <h4 className="text-white text-2xl font-bold mb-2" style={{ fontFamily: 'var(--cw-display-font)' }}>RECENT FILINGS</h4>
+          <div className="space-y-2">
+            {filings.slice(0, 3).map((f, i) => (
+              <div key={i} className="text-white/90 text-lg border-b border-white/10 pb-1">
+                <p className="font-semibold">{f.form_type || 'Filing'} <span className="text-white/60 text-base">{fmtDate(f.receipt_date)}</span></p>
+                <p className="text-white/70 text-base">Period: {fmtDate(f.coverage_end_date)} -- Receipts {fmtMoney(f.total_receipts_period)}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Voting / bills (incumbents only) */}
+      {incumbent && sponsored.length > 0 && (
+        <div className="bg-black/40 border border-white/15 rounded-xl p-4">
+          <h4 className="text-white text-2xl font-bold mb-2" style={{ fontFamily: 'var(--cw-display-font)' }}>RECENT BILLS SPONSORED</h4>
+          <div className="space-y-2">
+            {sponsored.slice(0, 4).map((b, i) => (
+              <div key={i} className="text-white/90 text-lg border-b border-white/10 pb-1">
+                <p className="font-semibold">{b.type || ''} {b.number || ''} <span className="text-white/60 text-base">{fmtDate(b.introduced_date)}</span></p>
+                <p className="text-white/80 text-base">{b.title}</p>
+                {b.latest_action && <p className="text-white/50 text-sm italic">{b.latest_action}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!incumbent && (
+        <p className="text-white/50 text-base text-center italic">Voting record shown only for incumbents.</p>
+      )}
+
+      <p className="text-white/40 text-sm text-center">Money: FEC. Bills: Congress.gov.</p>
+    </div>
+  );
+};
+
+// == App ======================================================================
+function App() {
+  const [page, setPage] = useState('login');
+  const [auth, setAuth] = useState(false);
+  const [user, setUser] = useState(null);
+  const [watchlist, setWatchlist] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [searchResults, setSearchResults] = useState(null);
+  const [searched, setSearched] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [selectedCand, setSelectedCand] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [loadingSave, setLoadingSave] = useState(false);
+  const [checkingStats, setCheckingStats] = useState(false);
+  const [backendWaking, setBackendWaking] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [searchName, setSearchName] = useState('');
+  const [searchState, setSearchState] = useState('');
+  const [showDangerZone, setShowDangerZone] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [drawerData, setDrawerData] = useState(null);
+  const [autoOpenId, setAutoOpenId] = useState(null);
+  const [apiVersion, setApiVersion] = useState('...');
+  const [toast, setToast] = useState(null);
+
+  const showToast = (msg) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 2400);
+  };
+
+  useEffect(() => {
+    fetch(API_BASE + '/health').then(r => r.json()).then(d => setApiVersion(d.version || '?')).catch(() => setApiVersion('?'));
+    const t = localStorage.getItem('token');
+    const u = localStorage.getItem('user');
+    if (t && u) { setUser(JSON.parse(u)); setAuth(true); setPage('search'); loadWatchlist(); loadNotifications(); }
+  }, []);
+
+  useEffect(() => {
+    if (autoOpenId && page === 'mycandidates' && watchlist.length > 0) {
+      const wItem = watchlist.find(w => w.id === autoOpenId);
+      if (wItem) { openMyCandidatesDrawer(wItem); setAutoOpenId(null); }
+    }
+    // eslint-disable-next-line
+  }, [autoOpenId, page, watchlist]);
+
+  const loadWatchlist = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const r = await fetch(API_BASE + '/watchlist', { headers: { 'Authorization': 'Bearer ' + token } });
+      if (!r.ok) throw new Error('Failed');
+      setWatchlist(await r.json());
+    } catch (e) { console.error(e); }
+  };
+  const loadNotifications = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const r = await fetch(API_BASE + '/notifications', { headers: { 'Authorization': 'Bearer ' + token } });
+      if (!r.ok) throw new Error('Failed');
+      setNotifications(await r.json());
+    } catch (e) { console.error(e); }
+  };
+  const dismissAlert = async (notifId) => {
+    const token = localStorage.getItem('token');
+    setNotifications(prev => prev.filter(n => n.id !== notifId));
+    try { await fetch(API_BASE + '/notifications/' + notifId, { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + token } }); } catch(e) {}
+  };
+  const viewAlert = (n) => {
+    const wItem = watchlist.find(w => w.id === n.watchlist_id);
+    if (wItem) { setPage('mycandidates'); setAutoOpenId(wItem.id); }
+  };
+  const doAuth = async (authMode) => {
+    if (!email || !password) return;
+    setLoading(true); setBackendWaking(false);
+    const wakeTimer = setTimeout(() => setBackendWaking(true), 3000);
+    try {
+      const endpoint = authMode === 'register' ? 'register' : 'login';
+      const r = await fetch(API_BASE + '/auth/' + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
+      clearTimeout(wakeTimer); setBackendWaking(false);
+      if (!r.ok) { const err = await r.json(); throw new Error(err.detail || 'Auth failed'); }
+      const data = await r.json();
+      localStorage.setItem('token', data.access_token);
+      const u = { email, id: '123', name: email.split('@')[0] };
+      localStorage.setItem('user', JSON.stringify(u));
+      setUser(u); setAuth(true); setPage('search');
+      loadWatchlist(); loadNotifications();
+    } catch (error) { clearTimeout(wakeTimer); setBackendWaking(false); alert('Error: ' + error.message); }
+    finally { setLoading(false); }
+  };
+  const doLogout = () => {
+    localStorage.removeItem('token'); localStorage.removeItem('user');
+    setAuth(false); setUser(null); setWatchlist([]); setNotifications([]);
+    setSearchResults(null); setSearched(false); setSelectedCand(null); setPage('login');
+  };
+  const doDeleteAccount = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const r = await fetch(API_BASE + '/account', { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + token } });
+      if (!r.ok) throw new Error('Failed');
+      doLogout(); alert('Your account has been permanently deleted.');
+    } catch (error) { alert('Error: ' + error.message); }
+  };
+  const clearSearch = () => { setSearchResults(null); setSearched(false); setSelectedCand(null); setSearchName(''); setSearchState(''); };
+  const isOnList = (name) => { if (!name) return false; const lower = name.trim().toLowerCase(); return !!watchlist.find(w => w && w.name && w.name.trim().toLowerCase() === lower); };
+  const parseMeta = (locationField) => { if (!locationField) return null; try { return JSON.parse(locationField); } catch(e) { return null; } };
+
+  const doSearch = async () => {
+    if (document.activeElement) document.activeElement.blur();
+    const name = (searchName || '').trim().replace(/\s+/g, ' ');
+    if (!name || name.length < 2) { alert('Please enter a candidate name.'); return; }
+    setSearching(true); setSearchResults(null); setSelectedCand(null);
+    try {
+      const st = (searchState || '').trim().toUpperCase().slice(0, 2);
+      const [wiki, candidates] = await Promise.all([
+        fetchWikiBio(name).catch(() => null),
+        fetchFecSearch(name, 'S', st || null).catch(() => [])
+      ]);
+      setSearchResults({ wiki, candidates, queryName: name });
+      setSearched(true);
+      if (candidates.length === 1) setSelectedCand(candidates[0]);
+    } catch(e) {
+      setSearchResults({ wiki: null, candidates: [], queryName: name });
+      setSearched(true);
+    }
+    finally { setSearching(false); }
+  };
+
+  // SAVE: POST -> fetch FEC profile -> store snapshot -> navigate -> open drawer
+  const saveCandidate = async () => {
+    const cand = selectedCand;
+    if (!cand) return;
+    const candName = cand.name;
+    if (isOnList(candName)) { alert(candName + ' is already saved.'); return; }
+    setLoadingSave(true);
+    try {
+      const token = localStorage.getItem('token');
+      const meta = JSON.stringify({
+        fecId: cand.candidate_id,
+        office: cand.office,
+        state: cand.state,
+        district: cand.district,
+        party: cand.party,
+        partyAbbr: partyAbbrev(cand.party),
+        incumbent: (cand.incumbent_challenge || '').toLowerCase().indexOf('incumbent') >= 0,
+        principalCommittee: cand.principal_committee || null,
+        cycle: cand.cycle || null,
+      });
+      const r = await fetch(API_BASE + '/watchlist', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ name: candName, location: meta, dob: '' })
+      });
+      if (!r.ok) throw new Error('Failed');
+      var newId = null;
+      try { const created = await r.json(); newId = created.id || null; } catch(e) {}
+      // Build snapshot client-side too (faster drawer open)
+      const profile = await fetchFecCandidate(cand.candidate_id).catch(() => null);
+      const snap = buildSnapshot(profile, null);
+      if (snap && newId) saveStatSnapshot(newId, snap);
+      await loadWatchlist();
+      if (!newId) {
+        const fresh = (await (await fetch(API_BASE + '/watchlist', { headers: { 'Authorization': 'Bearer ' + token } })).json())
+          .find(w => w.name && w.name.trim().toLowerCase() === candName.trim().toLowerCase());
+        if (fresh) {
+          newId = fresh.id;
+          if (snap) saveStatSnapshot(newId, snap);
         }
-    else:
-        snap["latest_bill"] = None
+      }
+      clearSearch(); setPage('mycandidates');
+      if (newId) setAutoOpenId(newId);
+    } catch(e) { alert('Error: ' + e.message); }
+    finally { setLoadingSave(false); }
+  };
 
-return snap
-```
+  const delCandidate = async (id) => {
+    try {
+      const token = localStorage.getItem('token');
+      const r = await fetch(API_BASE + '/watchlist/' + id, { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + token } });
+      if (!r.ok) throw new Error('Failed');
+      deleteStatSnapshot(id);
+      await loadWatchlist();
+    } catch (error) { alert('Error: ' + error.message); }
+  };
 
-def fmt_money(v) -> str:
-try:
-n = float(v or 0)
-except Exception:
-return “$0”
-return “${:,.0f}”.format(n)
+  // Watchlist drawer (light): bio + Check button
+  const openWatchlistDrawer = async (wItem) => {
+    const meta = parseMeta(wItem.location);
+    setDrawerData({ mode: 'watchlist', name: wItem.name, watchlistId: wItem.id, meta: meta, wiki: null, snapshot: null, loading: true });
+    const wiki = await fetchWikiBio(wItem.name).catch(() => null);
+    setDrawerData(prev => prev ? Object.assign({}, prev, { wiki: wiki, loading: false }) : null);
+  };
 
-def diff_snapshots(old, new):
-“”“Compare two snapshots. Returns list of short alert messages.
-First-run (old is None) returns [] – never alert on the first capture.”””
-if old is None or new is None:
-return []
-alerts = []
+  // My Candidates drawer (full): bio + StatPanel from snapshot (or live fallback)
+  const openMyCandidatesDrawer = async (wItem) => {
+    const meta = parseMeta(wItem.location);
+    let snapshot = getStatSnapshot(wItem.id);
+    setDrawerData({ mode: 'mycandidates', name: wItem.name, watchlistId: wItem.id, meta: meta, wiki: null, snapshot: snapshot, loading: true });
+    const wiki = await fetchWikiBio(wItem.name).catch(() => null);
+    if (!snapshot && meta && meta.fecId) {
+      const profile = await fetchFecCandidate(meta.fecId).catch(() => null);
+      const snap = buildSnapshot(profile, null);
+      if (snap) { saveStatSnapshot(wItem.id, snap); snapshot = snap; }
+    }
+    // For incumbents, fetch congress data lazily and merge into snapshot
+    if (snapshot && meta && meta.incumbent && meta.bioguideId) {
+      try {
+        const cong = await fetchCongressMember(meta.bioguideId);
+        if (cong) {
+          snapshot = Object.assign({}, snapshot, { congress: cong });
+          saveStatSnapshot(wItem.id, snapshot);
+        }
+      } catch(e) {}
+    }
+    setDrawerData(prev => prev ? Object.assign({}, prev, { wiki: wiki, snapshot: snapshot, loading: false }) : null);
+  };
 
-```
-# New FEC filing
-old_fid = old.get("last_filing_id") or ""
-new_fid = new.get("last_filing_id") or ""
-if new_fid and new_fid != old_fid:
-    date_part = new.get("last_filing_date") or ""
-    receipts_part = fmt_money(new.get("receipts"))
-    msg = "New FEC filing posted"
-    if date_part:
-        msg += " (" + date_part + ")"
-    msg += ". Cycle receipts now " + receipts_part + "."
-    alerts.append(msg)
+  // Check for new data: re-fetch, diff, transform drawer in place
+  const checkForNewStats = async () => {
+    if (!drawerData || !drawerData.watchlistId) return;
+    const meta = drawerData.meta;
+    if (!meta || !meta.fecId) { alert('No FEC data linked to this candidate.'); return; }
+    setCheckingStats(true);
+    try {
+      const profile = await fetchFecCandidate(meta.fecId);
+      const cong = (meta.incumbent && meta.bioguideId) ? await fetchCongressMember(meta.bioguideId).catch(() => null) : null;
+      const newSnap = buildSnapshot(profile, cong);
+      if (!newSnap) { alert('Could not reach FEC. Try again later.'); return; }
+      const oldSnap = getStatSnapshot(drawerData.watchlistId);
+      if (!snapshotChanged(oldSnap, newSnap)) { showToast('No New Filings Yet'); return; }
+      saveStatSnapshot(drawerData.watchlistId, newSnap);
+      setDrawerData(prev => prev ? Object.assign({}, prev, { mode: 'mycandidates', snapshot: newSnap }) : null);
+    } catch(e) { alert('Error: ' + e.message); }
+    finally { setCheckingStats(false); }
+  };
 
-# Incumbent challenge status change (e.g. challenger -> incumbent after winning)
-old_ic = (old.get("incumbent_challenge") or "").lower()
-new_ic = (new.get("incumbent_challenge") or "").lower()
-if old_ic and new_ic and old_ic != new_ic:
-    alerts.append("Status changed: " + old.get("incumbent_challenge", "") + " -> " + new.get("incumbent_challenge", ""))
+  const unreadCount = notifications.length;
+  const iClass = "w-full px-4 py-3 border border-white/30 rounded-lg focus:ring-2 focus:ring-yellow-500 text-xl bg-black/40 text-white placeholder-gray-400";
+  const cardClass = "rounded-2xl p-4 shadow-lg backdrop-blur-sm";
+  const cardStyle = { backgroundColor: 'var(--cw-card-bg)', borderColor: 'var(--cw-card-border)', borderWidth: '1px' };
+  const containerClass = (page === 'about') ? 'w-full max-w-3xl mx-auto px-3' : 'w-full px-3';
 
-# New sponsored bill (incumbents)
-old_bill = old.get("latest_bill") or {}
-new_bill = new.get("latest_bill") or {}
-old_num = (old_bill.get("type") or "") + (old_bill.get("number") or "")
-new_num = (new_bill.get("type") or "") + (new_bill.get("number") or "")
-if new_num and new_num != old_num:
-    title = new_bill.get("title") or ""
-    if len(title) > 120:
-        title = title[:117] + "..."
-    alerts.append("New bill sponsored: " + new_bill.get("type", "") + " "
-                  + new_bill.get("number", "") + " -- " + title)
+  const CandidateCard = ({ wiki, candidate, showSaveButton }) => {
+    if (!candidate && !wiki) return null;
+    const display = (candidate && candidate.name) || (wiki && wiki.title) || '';
+    const photo = (wiki && wiki.thumbnail && wiki.thumbnail.source) || '';
+    const alreadySaved = isOnList(display);
+    const pColor = candidate ? partyColor(candidate.party) : '#9CA3AF';
+    const pAbbr = candidate ? partyAbbrev(candidate.party) : '';
+    return (
+      <div className="rounded-2xl overflow-hidden border border-white/15 shadow-lg" style={{ backgroundColor: 'rgba(0,0,0,0.55)' }}>
+        <div className="px-5 py-3 text-center" style={{ background: 'linear-gradient(90deg, var(--cw-accent), var(--cw-accent-2))' }}>
+          <p className="text-white font-black text-3xl">{display}</p>
+          {candidate && (
+            <p className="text-white/90 text-xl">
+              <span style={{ display: 'inline-block', backgroundColor: pColor, color: '#fff', padding: '0 0.5rem', borderRadius: '0.25rem', marginRight: '0.5rem', fontWeight: 700 }}>{pAbbr || '?'}</span>
+              {officeLabel(candidate.office, candidate.state, candidate.district)}
+            </p>
+          )}
+        </div>
+        <div className="p-4">
+          <div className="flex gap-3 items-start mb-3">
+            {photo ? <img src={photo} alt={display} className="w-20 h-20 rounded-full object-cover border-2 border-white/30 shrink-0" /> : <div className="w-20 h-20 rounded-full bg-black/40 flex items-center justify-center shrink-0 text-2xl text-white">?</div>}
+            <div className="flex-1">
+              {wiki && wiki.description && <p className="text-yellow-200 text-xl italic">{wiki.description}</p>}
+              {candidate && candidate.incumbent_challenge && <p className="text-white/70 text-base mt-1 uppercase">{candidate.incumbent_challenge}</p>}
+            </div>
+          </div>
+          {wiki && wiki.extract && <p className="text-gray-100 text-xl leading-relaxed mb-3">{wiki.extract}</p>}
+          {showSaveButton && (
+            <div className="space-y-2">
+              {alreadySaved ? <p className="text-green-300 text-xl text-center font-bold">Already saved</p> : <button onClick={saveCandidate} disabled={loadingSave || !candidate} className="w-full py-4 text-white rounded-xl font-bold text-2xl flex items-center justify-center gap-2 disabled:opacity-50" style={{ backgroundColor: 'var(--cw-accent)' }}><PlusIcon /> {loadingSave ? 'Saving...' : 'Save Candidate'}</button>}
+              {!candidate && <p className="text-yellow-300 text-base text-center">No FEC match. Pick a different name or check spelling.</p>}
+              <button onClick={clearSearch} className="w-full py-3 bg-white/10 border border-white/20 text-white/80 rounded-xl text-xl text-center">Clear Search</button>
+            </div>
+          )}
+          <p className="text-gray-400 text-sm mt-3 text-center">Bio: Wikipedia. Money: FEC. Bills: Congress.gov.</p>
+        </div>
+      </div>
+    );
+  };
 
-return alerts
-```
+  const Drawer = () => {
+    if (!drawerData) return null;
+    const { mode, name, meta, wiki, snapshot, loading: drawerLoading } = drawerData;
+    const photo = (wiki && wiki.thumbnail && wiki.thumbnail.source) || '';
+    const pColor = meta ? partyColor(meta.party) : '#9CA3AF';
+    const pAbbr = meta ? partyAbbrev(meta.party) : '';
+    return (
+      <>
+        <div className="modal-overlay" onClick={() => setDrawerData(null)} />
+        <div className="modal-drawer">
+          <div className="flex justify-between items-center px-4 pt-4 pb-2 border-b border-white/15">
+            <h3 className="text-white font-bold text-2xl">{name}</h3>
+            <button onClick={() => setDrawerData(null)} className="text-gray-400 hover:text-white text-2xl font-bold">X</button>
+          </div>
+          <div className="p-4">
+            {drawerLoading && <div className="text-center py-8"><p className="text-white animate-pulse text-xl">Loading...</p></div>}
+            {!drawerLoading && (
+              <>
+                <div className="px-4 py-3 rounded-xl mb-3 text-center" style={{ background: 'linear-gradient(90deg, var(--cw-accent), var(--cw-accent-2))' }}>
+                  <p className="text-white font-black text-3xl">{name}</p>
+                  {meta && (
+                    <p className="text-white/90 text-xl">
+                      <span style={{ display: 'inline-block', backgroundColor: pColor, color: '#fff', padding: '0 0.5rem', borderRadius: '0.25rem', marginRight: '0.5rem', fontWeight: 700 }}>{pAbbr || '?'}</span>
+                      {officeLabel(meta.office, meta.state, meta.district)}
+                    </p>
+                  )}
+                </div>
+                <div className="flex gap-3 items-start mb-3">
+                  {photo ? <img src={photo} alt={name} className="w-20 h-20 rounded-full object-cover border-2 border-white/30 shrink-0" /> : <div className="w-20 h-20 rounded-full bg-black/40 flex items-center justify-center shrink-0 text-2xl text-white">?</div>}
+                  <div className="flex-1">
+                    {wiki && wiki.description && <p className="text-yellow-200 text-xl italic">{wiki.description}</p>}
+                    {meta && meta.incumbent && <p className="text-green-300 text-base mt-1 uppercase">Incumbent</p>}
+                  </div>
+                </div>
+                {wiki && wiki.extract && <p className="text-gray-100 text-xl leading-relaxed mb-3">{wiki.extract}</p>}
+                {mode === 'watchlist' && (
+                  <button onClick={checkForNewStats} disabled={checkingStats} className="w-full py-4 text-white rounded-xl font-bold text-2xl flex items-center justify-center gap-2 disabled:opacity-50 mt-2" style={{ backgroundColor: 'var(--cw-accent)' }}>
+                    <RefreshIcon /> {checkingStats ? 'Checking...' : 'Check for new filings'}
+                  </button>
+                )}
+                {mode === 'mycandidates' && <StatPanel snapshot={snapshot} />}
+                {mode === 'mycandidates' && snapshot && snapshot.capturedAt && (<p className="text-white/40 text-sm text-center mt-3">Last updated {new Date(snapshot.capturedAt).toLocaleString()}</p>)}
+              </>
+            )}
+            <button onClick={() => setDrawerData(null)} className="w-full py-4 bg-white/10 border border-white/20 text-white rounded-xl text-xl mt-4">Close</button>
+          </div>
+        </div>
+      </>
+    );
+  };
 
-# == Daily watchlist cron =====================================================
+  if (page === 'login') {
+    return (
+      <div className="page-bg" style={{ display: 'flex', flexDirection: 'column', minHeight: '100dvh' }}>
+        <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1 }} />
+        <div style={{ position: 'relative', zIndex: 2, display: 'flex', flexDirection: 'column', alignItems: 'stretch', flex: 1, justifyContent: 'center' }}>
+          <div style={{ textAlign: 'center', padding: '2rem 1.5rem 1.5rem' }}>
+            <h1 style={{ color: '#fff', fontSize: isPhone ? '4.5rem' : '6.5rem', fontWeight: 900, fontFamily: 'var(--cw-display-font)', letterSpacing: '0.04em', lineHeight: 0.9, WebkitTextStroke: '2px #fff', textShadow: '0 4px 20px rgba(0,0,0,0.95), 0 2px 8px rgba(0,0,0,0.9)', margin: 0 }}>CANDIDATE<br/>WATCH</h1>
+            <p style={{ color: '#fff', fontSize: isPhone ? '1.6rem' : '2rem', fontFamily: 'var(--cw-display-font)', letterSpacing: '0.04em', lineHeight: 1.15, textShadow: '0 2px 8px rgba(0,0,0,0.9)', marginTop: '1.25rem' }}>Track Senate Candidates<br/>Across the Country</p>
+          </div>
+          <div style={{ paddingLeft: '1.5rem', paddingRight: '1.5rem' }}>
+            <div className="rounded-2xl p-4 shadow-2xl space-y-3" style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(8px)', borderColor: 'var(--cw-card-border)', borderWidth: '1px' }}>
+              <input type="email" placeholder="Email address" value={email} onChange={(e) => setEmail(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && doAuth('login')} className="w-full px-4 py-3 rounded-xl bg-white/15 border border-white/30 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-yellow-500 text-xl" />
+              <div className="relative">
+                <input type={showPassword ? 'text' : 'password'} placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && doAuth('login')} className="w-full px-4 py-3 rounded-xl bg-white/15 border border-white/30 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-yellow-500 text-xl" />
+                <button onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-white/60">{showPassword ? <EyeOffIcon /> : <EyeIcon />}</button>
+              </div>
+              {backendWaking && <p className="text-white/60 text-xl text-center animate-pulse">Waking up the server...</p>}
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={() => doAuth('login')} disabled={loading} className="py-4 text-white font-bold rounded-xl disabled:opacity-50 text-2xl" style={{ backgroundColor: 'var(--cw-accent)' }}>{loading ? '...' : 'Sign In'}</button>
+                <button onClick={() => doAuth('register')} disabled={loading} className="py-4 text-white font-bold rounded-xl disabled:opacity-50 text-2xl border" style={{ backgroundColor: 'rgba(184,148,31,0.4)', borderColor: 'rgba(255,255,255,0.4)' }}>{loading ? '...' : 'Register'}</button>
+              </div>
+              <p className="text-white/50 text-xl text-center">You'll stay signed in automatically</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
-def check_all_watched_candidates():
-“”“Daily job: iterate active watchlist, fetch FEC, diff, write notifications.”””
-print(”[cron] Starting daily watchlist check at “ + datetime.now().isoformat())
-if not FEC_API_KEY:
-print(”[cron] Skipped: FEC_API_KEY not configured”)
-return
-checked = 0
-alerted = 0
-skipped = 0
-try:
-with get_db() as conn:
-c = conn.cursor()
-c.execute(””“SELECT id, user_id, name, location FROM cw_watchlist
-WHERE status = ‘active’
-AND location IS NOT NULL
-AND location != ‘’”””)
-rows = c.fetchall()
+  return (
+    <PageWrapper>
+      <Drawer />
+      {toast && (
+        <div style={{ position: 'fixed', left: '50%', transform: 'translateX(-50%)', bottom: 'calc(6rem + env(safe-area-inset-bottom))', zIndex: 200, backgroundColor: 'var(--cw-accent)', color: '#fff', padding: '1.1rem 1.8rem', borderRadius: '999px', border: '1px solid rgba(255,255,255,0.25)', fontSize: '1.5rem', fontWeight: 700, boxShadow: '0 6px 20px rgba(0,0,0,0.6)', whiteSpace: 'nowrap' }}>{toast}</div>
+      )}
+      <div className={containerClass}>
 
-```
-    for row in rows:
-        watchlist_id, user_id, name, location = row
-        new_snap = build_alert_snapshot(location)
-        if new_snap is None:
-            skipped += 1
-            continue
-        checked += 1
+        {page === 'search' && (
+          <div className="space-y-3" style={{ paddingTop: PT }}>
+            <div className="flex flex-col items-center" style={{ height: PT, marginTop: '-' + PT, paddingTop: '4rem', paddingBottom: '1.5rem', pointerEvents: 'none' }}>
+              <h1 className="text-white font-black text-center" style={{ fontSize: isPhone ? '5rem' : '7rem', fontFamily: 'var(--cw-display-font)', letterSpacing: '0.04em', lineHeight: 0.9, textShadow: '0 4px 16px rgba(0,0,0,0.9)' }}>CANDIDATE<br/>WATCH</h1>
+              <p className="text-white text-center" style={{ fontSize: isPhone ? '1.8rem' : '2.4rem', fontFamily: 'var(--cw-display-font)', letterSpacing: '0.04em', lineHeight: 1.05, textShadow: '0 2px 8px rgba(0,0,0,0.9)', marginTop: '1rem' }}>Who Are You<br/>Watching?</p>
+            </div>
+            <div className={cardClass} style={Object.assign({}, cardStyle, { overflowY: 'auto', maxHeight: 'calc(100dvh - ' + PT + ' - 6rem)' })}>
+              {searching && <p className="text-white text-center py-4 animate-pulse text-xl">Searching FEC...</p>}
+              {!searched ? (
+                <div className="space-y-2">
+                  <ClearableInput value={searchName} onChange={(e) => setSearchName(e.target.value)} onBlur={(e) => setSearchName(e.target.value.trim())} onKeyPress={(e) => e.key === 'Enter' && doSearch()} placeholder="Candidate name" inputClass={iClass} />
+                  <ClearableInput value={searchState} onChange={(e) => setSearchState(e.target.value.toUpperCase().slice(0,2))} onKeyPress={(e) => e.key === 'Enter' && doSearch()} placeholder="State (optional, e.g. TX)" maxLength={2} inputClass={iClass} />
+                  <button onClick={doSearch} disabled={searching} className="w-full py-3 text-white rounded-lg flex items-center justify-center gap-2 disabled:opacity-50 text-2xl font-bold" style={{ backgroundColor: 'var(--cw-accent)' }}>
+                    <SearchIcon /> {searching ? 'Searching...' : 'Find Candidate'}
+                  </button>
+                  <p className="text-gray-300 text-sm text-center">Senate candidates, current cycle. Source: Federal Election Commission.</p>
+                </div>
+              ) : (<SearchResultView />)}
+            </div>
+          </div>
+        )}
 
-        # Read prior
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT snapshot_json FROM cw_snapshots WHERE watchlist_id = %s",
-                      (watchlist_id,))
-            prior = c.fetchone()
-        old_snap = None
-        if prior and prior[0]:
-            try:
-                old_snap = json_lib.loads(prior[0])
-            except Exception:
-                old_snap = None
+        {page === 'watchlist' && (
+          <div className="space-y-3" style={{ paddingTop: '1rem' }}>
+            <div className={cardClass} style={cardStyle}>
+              <CardPageHeader title="Watchlist" subtitle="Tap a name -- check for new filings" />
+              {watchlist.length === 0 && (<div className="py-6 text-center"><p className="text-gray-200 text-xl leading-relaxed mb-2">No candidates yet.</p><p className="text-white text-xl font-medium">Use Search to add candidates.</p></div>)}
+              {watchlist.length > 0 && (
+                <div className="space-y-2 mt-2">
+                  {watchlist.map(w => {
+                    const meta = parseMeta(w.location);
+                    const pColor = meta ? partyColor(meta.party) : '#9CA3AF';
+                    const pAbbr = meta ? partyAbbrev(meta.party) : '';
+                    return (
+                      <div key={w.id} className="p-4 rounded-lg border bg-black/40 border-white/15">
+                        <div className="flex items-center justify-between">
+                          <div className="flex-1 min-w-0">
+                            <button onClick={() => openWatchlistDrawer(w)} className="text-left w-full">
+                              <h3 className="font-semibold text-2xl text-white underline decoration-dotted truncate">{w.name}</h3>
+                            </button>
+                            {meta && (
+                              <p className="text-xl text-gray-300">
+                                <span style={{ display: 'inline-block', backgroundColor: pColor, color: '#fff', padding: '0 0.4rem', borderRadius: '0.25rem', marginRight: '0.4rem', fontWeight: 700, fontSize: '0.95rem' }}>{pAbbr || '?'}</span>
+                                {officeLabel(meta.office, meta.state, meta.district)}
+                              </p>
+                            )}
+                            {meta && meta.incumbent && <p className="text-base text-green-300/80 uppercase">Incumbent</p>}
+                            <div className="flex items-center gap-1 mt-1"><CheckIcon /><span className="text-xl text-green-300">Watching</span></div>
+                          </div>
+                          <button onClick={() => delCandidate(w.id)} className="p-2 text-red-400 hover:bg-red-900/30 rounded-lg ml-2 shrink-0"><TrashIcon /></button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
-        alerts = diff_snapshots(old_snap, new_snap)
-        if alerts:
-            with get_db() as conn:
-                c = conn.cursor()
-                for msg in alerts:
-                    c.execute("""INSERT INTO cw_notifications
-                                 (user_id, watchlist_id, message)
-                                 VALUES (%s, %s, %s)""",
-                              (user_id, watchlist_id, msg))
-                conn.commit()
-            alerted += 1
+        {page === 'mycandidates' && (
+          <div className="space-y-3" style={{ paddingTop: '1rem' }}>
+            <div className={cardClass} style={cardStyle}>
+              <CardPageHeader title="My Candidates" subtitle="Your saved candidates and finance data" />
+              {watchlist.length === 0 ? (<div className="text-center py-6"><p className="text-gray-200 text-xl leading-relaxed">Search for a candidate and save them here.</p></div>) : (
+                <div className="space-y-3">
+                  <p className="text-gray-300 text-lg text-center mb-1">Tap a name to see latest data</p>
+                  {watchlist.map(w => {
+                    const meta = parseMeta(w.location);
+                    const pColor = meta ? partyColor(meta.party) : '#9CA3AF';
+                    const pAbbr = meta ? partyAbbrev(meta.party) : '';
+                    return (
+                      <div key={w.id} className="p-4 bg-black/50 rounded-lg border border-white/15">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3 flex-1 min-w-0">
+                            <div className="w-14 h-14 rounded-full bg-black/40 flex items-center justify-center shrink-0 text-xl text-white border" style={{ borderColor: pColor }}>
+                              <span style={{ color: pColor, fontWeight: 700 }}>{pAbbr || '?'}</span>
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <button onClick={() => openMyCandidatesDrawer(w)} className="text-left w-full">
+                                <h3 className="font-semibold text-2xl text-white underline decoration-dotted truncate">{w.name}</h3>
+                              </button>
+                              {meta && <p className="text-base text-gray-300">{officeLabel(meta.office, meta.state, meta.district)}</p>}
+                              {meta && meta.incumbent && <p className="text-base text-green-300/80 uppercase">Incumbent</p>}
+                            </div>
+                          </div>
+                          <button onClick={() => delCandidate(w.id)} className="p-2 text-red-400 hover:bg-red-900/30 rounded-lg ml-2 shrink-0"><TrashIcon /></button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
-        # Always upsert snapshot
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT INTO cw_snapshots (watchlist_id, snapshot_json, captured_at)
-                         VALUES (%s, %s, CURRENT_TIMESTAMP)
-                         ON CONFLICT (watchlist_id) DO UPDATE
-                         SET snapshot_json = EXCLUDED.snapshot_json,
-                             captured_at = CURRENT_TIMESTAMP""",
-                      (watchlist_id, json_lib.dumps(new_snap)))
-            conn.commit()
+        {page === 'notifications' && (
+          <div className="space-y-3" style={{ paddingTop: '1rem' }}>
+            <div className={cardClass} style={cardStyle}>
+              <CardPageHeader title="Alerts" subtitle="New filings, fundraising swings, key votes" />
+              {notifications.length === 0 ? (<div className="text-center py-4"><p className="text-white font-bold text-2xl">No alerts yet</p><p className="text-gray-200 text-xl mt-1">We check your candidates every 24 hours.</p></div>) : (
+                <div className="space-y-3">
+                  {notifications.map(n => (
+                    <div key={n.id} className="p-3 bg-black/50 border border-white/15 rounded-xl">
+                      <h3 className="font-bold text-white text-xl mb-1">{n.name}</h3>
+                      <p className="text-gray-200 text-xl">{n.message}</p>
+                      <p className="text-gray-400 text-base mt-1 mb-2">{new Date(n.created_at).toLocaleDateString()}</p>
+                      <div className="flex gap-2">
+                        <button onClick={() => viewAlert(n)} className="flex-1 py-2 text-white rounded-lg text-xl font-bold" style={{ backgroundColor: 'var(--cw-accent)' }}>View</button>
+                        <button onClick={() => dismissAlert(n.id)} className="flex-1 py-2 bg-transparent border border-white/30 text-white/80 rounded-lg text-xl">Dismiss</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
-    print("[cron] Done. Checked " + str(checked)
-          + " candidates, " + str(alerted) + " with new alerts, "
-          + str(skipped) + " skipped (no FEC id or fetch failed)")
-except Exception as e:
-    print("[cron] Fatal error: " + str(e))
-```
+        {page === 'about' && (
+          <div className="space-y-4 pb-8" style={{ paddingTop: '1rem' }}>
+            <div className={cardClass} style={cardStyle}>
+              <div className="mb-3 pb-2 border-b border-white/15 text-center">
+                <h2 className="text-4xl font-black text-white" style={{ fontFamily: 'var(--cw-display-font)', letterSpacing: '0.06em', textTransform: 'uppercase', WebkitTextStroke: '1px #fff' }}>About</h2>
+                <h2 className="text-4xl font-black text-white" style={{ fontFamily: 'var(--cw-display-font)', letterSpacing: '0.06em', textTransform: 'uppercase', WebkitTextStroke: '1px #fff' }}>{APP_NAME}</h2>
+              </div>
+              <p className="text-white/80 italic text-xl text-center mb-3">v{APP_VERSION}</p>
+              <div className="flex items-center gap-4 mb-4">
+                <img src={BILL_PHOTO} alt="Bill Spencer" className="w-14 h-14 rounded-full object-cover border-2 border-white/30 shrink-0" />
+                <div>
+                  <p className="font-bold text-white text-xl">Bill Spencer</p>
+                  <p className="text-white/70 italic text-xl">Founder</p>
+                  <a href="mailto:hello@candidatewatch.app" className="text-white/80 text-xl mt-1 block">hello@candidatewatch.app</a>
+                </div>
+              </div>
+              <p className="text-white text-2xl font-bold italic mb-3">{TAGLINE}</p>
+              <div className="space-y-3 text-gray-100 text-xl leading-relaxed">
+                <p>The Senate candidates you care about, all in one place.</p>
+                <p>Add anyone running for U.S. Senate to your watchlist. Candidate Watch tracks the things that matter -- new FEC filings, fundraising changes, sponsored bills, key votes -- and tells you when something changes.</p>
+                <p>Just the facts. No polls. No predictions. No partisan spin.</p>
+              </div>
+            </div>
+            <div className={cardClass} style={cardStyle}>
+              <h3 className="text-white text-2xl font-bold mb-4 text-center" style={{ fontFamily: 'var(--cw-display-font)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>How it works</h3>
+              <div className="space-y-4">
+                <div className="flex gap-3 items-start"><span className="text-white text-2xl font-black w-7 shrink-0">1.</span><p className="text-gray-100 text-xl">Search by name. We pull bio from Wikipedia and finance data from the FEC.</p></div>
+                <div className="flex gap-3 items-start"><span className="text-white text-2xl font-black w-7 shrink-0">2.</span><p className="text-gray-100 text-xl">Save with one tap. We capture their current finances right away.</p></div>
+                <div className="flex gap-3 items-start"><span className="text-white text-2xl font-black w-7 shrink-0">3.</span><p className="text-gray-100 text-xl">Tap on Watchlist to check for new filings on demand.</p></div>
+                <div className="flex gap-3 items-start"><span className="text-white text-2xl font-black w-7 shrink-0">4.</span><p className="text-gray-100 text-xl">Tap on My Candidates to see saved finance and voting data.</p></div>
+              </div>
+            </div>
+            <div className={cardClass} style={cardStyle}>
+              <h3 className="font-bold text-white mb-1 text-2xl" style={{ fontFamily: 'var(--cw-display-font)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>Privacy</h3>
+              <p className="text-white/60 text-xl mb-3">Last updated: May 2026</p>
+              <div className="space-y-3 text-gray-100 text-xl leading-relaxed">
+                <p><strong className="text-white">We collect:</strong> your email, watchlist, and search activity.</p>
+                <p><strong className="text-white">We do not:</strong> sell your data, ever.</p>
+                <p><strong className="text-white">Sources:</strong> Bio from Wikipedia. Finance from the Federal Election Commission. Bills and votes from Congress.gov.</p>
+                <p><strong className="text-white">Your rights:</strong> Delete your account and all data anytime.</p>
+                <a href="mailto:hello@candidatewatch.app" className="text-white/80 text-xl">hello@candidatewatch.app</a>
+              </div>
+            </div>
+            <div className="px-1 space-y-3 pb-2">
+              <div className="p-3 bg-black/40 rounded-xl"><p className="font-medium text-white text-xl text-center">{user && user.email}</p></div>
+              <button onClick={doLogout} className="w-full py-4 text-white rounded-xl text-2xl font-bold" style={{ backgroundColor: 'var(--cw-accent)' }}>Sign Out</button>
+              <button onClick={() => setShowDangerZone(!showDangerZone)} className="w-full py-3 text-white/60 text-xl text-center">{showDangerZone ? 'Hide' : 'Account Removal'}</button>
+              {showDangerZone && (
+                <div className="space-y-3">
+                  {!showDeleteConfirm ? <button onClick={() => setShowDeleteConfirm(true)} className="w-full py-4 bg-black/60 border border-white/20 text-red-300 rounded-xl text-xl">Delete Account</button> : <div className="bg-black/80 border border-white/20 rounded-2xl p-5 space-y-3"><h3 className="font-bold text-red-300 text-xl">Are you sure?</h3><p className="text-white/80 text-xl">This permanently deletes your account.</p><button onClick={doDeleteAccount} className="w-full py-4 bg-red-700 text-white rounded-xl font-bold text-xl">Yes, Delete My Account</button><button onClick={() => { setShowDeleteConfirm(false); setShowDangerZone(false); }} className="w-full py-4 bg-white/10 border border-white/20 text-white rounded-xl text-xl">Cancel</button></div>}
+                </div>
+              )}
+            </div>
+            <p className="text-white/40 text-center text-sm pb-4">v{APP_VERSION}</p>
+          </div>
+        )}
 
-@app.post(”/admin/run-cron”)
-async def run_cron_manually(secret: str):
-“”“Manually trigger the daily check. Pass ?secret=… matching ADMIN_SECRET.”””
-if secret != os.environ.get(“ADMIN_SECRET”, “candidatewatch-cron-2026”):
-raise HTTPException(status_code=403, detail=“Forbidden”)
-check_all_watched_candidates()
-return {“status”: “completed”, “ran_at”: datetime.now().isoformat()}
+      </div>
 
-# Module-level scheduler – kept in scope so it isn’t garbage-collected
+      <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)', borderTop: '1px solid rgba(255,255,255,0.15)', padding: '0.5rem 1rem', paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}>
+        <div className="flex justify-around max-w-sm mx-auto">
+          <button onClick={() => { clearSearch(); setPage('search'); }} className={'flex flex-col items-center gap-0.5 px-1 py-1 ' + (page === 'search' ? 'text-white' : 'text-gray-400')}><SearchIcon /><span className="text-xl font-medium">Search</span></button>
+          <button onClick={() => setPage('watchlist')} className={'flex flex-col items-center gap-0.5 px-1 py-1 ' + (page === 'watchlist' ? 'text-white' : 'text-gray-400')}><HeartIcon /><span className="text-xl font-medium">Watchlist</span></button>
+          <button onClick={() => setPage('mycandidates')} className={'flex flex-col items-center gap-0.5 px-1 py-1 ' + (page === 'mycandidates' ? 'text-white' : 'text-gray-400')}>
+            <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+            <span className="text-xl font-medium">My Cands.</span>
+          </button>
+          <button onClick={() => setPage('about')} className={'flex flex-col items-center gap-0.5 px-1 py-1 ' + (page === 'about' ? 'text-white' : 'text-gray-400')}><InfoIcon /><span className="text-xl font-medium">Info</span></button>
+          <button onClick={() => setPage('notifications')} className={'flex flex-col items-center gap-0.5 px-1 py-1 relative ' + (page === 'notifications' ? 'text-white' : 'text-gray-400')}>
+            <BellIcon red={unreadCount > 0} />
+            {unreadCount > 0 && <span className="absolute top-0 right-1 text-white text-xl font-bold rounded-full w-4 h-4 flex items-center justify-center" style={{ backgroundColor: 'var(--cw-accent-2)' }}>{unreadCount > 9 ? '9+' : unreadCount}</span>}
+            <span className="text-xl font-medium">Alerts</span>
+          </button>
+        </div>
+        <p className="text-center text-white/40 text-xs mt-1" style={{ display: page === 'search' ? 'none' : 'block' }}>app v{APP_VERSION} | api v{apiVersion}</p>
+      </div>
+    </PageWrapper>
+  );
 
-_cw_scheduler = None
+  function SearchResultView() {
+    if (!searchResults) return null;
+    const { wiki, candidates, queryName } = searchResults;
+    if (!selectedCand && candidates.length > 1) {
+      return (
+        <div className="rounded-2xl overflow-hidden border border-white/15 shadow-lg" style={{ backgroundColor: 'rgba(0,0,0,0.55)' }}>
+          <div className="px-5 py-3 bg-yellow-700 text-center"><p className="text-white font-black text-3xl">Multiple Candidates Found</p><p className="text-white/90 text-xl">Pick the right one</p></div>
+          <div className="p-4 space-y-2">
+            {candidates.map((c, i) => {
+              const pColor = partyColor(c.party);
+              const pAbbr = partyAbbrev(c.party);
+              return (
+                <button key={i} onClick={() => setSelectedCand(c)} className="w-full p-3 bg-black/40 border border-white/15 rounded-xl text-left">
+                  <div className="flex items-center gap-3">
+                    <div className="w-12 h-12 rounded-full bg-black/40 flex items-center justify-center shrink-0 text-lg text-white border" style={{ borderColor: pColor }}>
+                      <span style={{ color: pColor, fontWeight: 700 }}>{pAbbr || '?'}</span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-white text-2xl font-bold truncate">{c.name}</p>
+                      <p className="text-white/70 text-xl truncate">{officeLabel(c.office, c.state, c.district)}</p>
+                      {c.incumbent_challenge && <p className="text-white/50 text-base uppercase">{c.incumbent_challenge}</p>}
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+            <button onClick={clearSearch} className="w-full py-3 bg-white/10 border border-white/20 text-white/80 rounded-xl text-xl text-center mt-2">Clear Search</button>
+          </div>
+        </div>
+      );
+    }
+    if (candidates.length === 0) {
+      return (
+        <div className="rounded-2xl overflow-hidden border border-white/15 shadow-lg" style={{ backgroundColor: 'rgba(0,0,0,0.55)' }}>
+          <div className="px-5 py-3 bg-blue-900 text-center"><p className="text-white font-black text-3xl">{queryName}</p><p className="text-white/90 text-xl">No FEC match found</p></div>
+          <div className="p-4">
+            {wiki ? (<><CandidateCard wiki={wiki} candidate={null} showSaveButton={false} /><p className="text-yellow-300 text-base text-center mt-3">Wikipedia bio shown above. FEC has no current candidate by this name -- try a different spelling or filter by state.</p></>) : (<p className="text-gray-200 text-xl text-center py-4">No results from Wikipedia or FEC.</p>)}
+            <button onClick={clearSearch} className="w-full py-3 bg-white/10 border border-white/20 text-white/80 rounded-xl text-xl text-center mt-2">Clear Search</button>
+          </div>
+        </div>
+      );
+    }
+    return <CandidateCard wiki={wiki} candidate={selectedCand || candidates[0]} showSaveButton={true} />;
+  }
+}
 
-# == Startup ==================================================================
-
-@app.on_event(“startup”)
-async def startup_event():
-init_db()
-print(“Candidate Watch DB initialized”)
-
-```
-# Schedule daily watchlist check at 14:00 UTC
-# = 4am HST / 9am EST winter / 10am EDT summer
-global _cw_scheduler
-_cw_scheduler = BackgroundScheduler(timezone="UTC")
-_cw_scheduler.add_job(
-    check_all_watched_candidates,
-    CronTrigger(hour=14, minute=0),
-    id="cw_daily_check",
-    replace_existing=True,
-)
-_cw_scheduler.start()
-print("Candidate Watch cron scheduled: daily at 14:00 UTC. Cycle=" + str(current_election_cycle()))
-```
-
-if **name** == “**main**”:
-import uvicorn
-uvicorn.run(app, host=“0.0.0.0”, port=8000)
+ReactDOM.render(React.createElement(App), document.getElementById('root'));
+</script>
+</body>
+</html>

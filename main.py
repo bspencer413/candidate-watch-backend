@@ -60,9 +60,12 @@ def init_db():
         dob TEXT,
         status TEXT DEFAULT 'active',
         is_memory BOOLEAN DEFAULT FALSE,
+        in_my_candidates BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES cw_users (id)
     )""")
+    # Migration: add column if table existed without it
+    c.execute("""ALTER TABLE cw_watchlist ADD COLUMN IF NOT EXISTS in_my_candidates BOOLEAN DEFAULT FALSE""")
     c.execute("""CREATE TABLE IF NOT EXISTS cw_notifications (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -111,7 +114,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.2.5")
+app = FastAPI(title="Candidate Watch API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -153,7 +156,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.2.5", "app": "Candidate Watch",
+            "version": "0.3.0", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -201,12 +204,13 @@ async def delete_account(user_id: int = Depends(get_current_user)):
 async def get_watchlist(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute("""SELECT id, name, location, dob, status, created_at, is_memory
+        c.execute("""SELECT id, name, location, dob, status, created_at, is_memory, in_my_candidates
                      FROM cw_watchlist WHERE user_id = %s AND status = 'active'
                      ORDER BY created_at DESC""", (user_id,))
         return [{"id": r[0], "name": r[1], "location": r[2], "dob": r[3],
                  "status": r[4], "created_at": str(r[5]),
-                 "is_memory": r[6] or False}
+                 "is_memory": r[6] or False,
+                 "in_my_candidates": r[7] or False}
                 for r in c.fetchall()]
 
 @app.post("/watchlist")
@@ -296,6 +300,20 @@ async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_curren
         conn.commit()
 
     return {"changed": len(alerts) > 0, "alerts": alerts, "snapshot": new_snap}
+
+@app.post("/watchlist/{item_id}/promote")
+async def promote_to_my_candidates(item_id: int, user_id: int = Depends(get_current_user)):
+    """Flip in_my_candidates flag for an item already on the watchlist."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE cw_watchlist SET in_my_candidates = TRUE
+                     WHERE id = %s AND user_id = %s AND status = 'active'""",
+                  (item_id, user_id))
+        if c.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Not found")
+        conn.commit()
+    return {"promoted": True, "id": item_id}
 
 # == Notifications ============================================================
 

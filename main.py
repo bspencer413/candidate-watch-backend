@@ -111,7 +111,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.2.4")
+app = FastAPI(title="Candidate Watch API", version="0.2.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -153,7 +153,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.2.4", "app": "Candidate Watch",
+            "version": "0.2.5", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -351,7 +351,6 @@ def fec_search_candidates(name: str, office: str = "S", state: Optional[str] = N
         "name": name,
         "office": office,
         "per_page": limit,
-        "sort": "-last_file_date",
     }
     if cycle:
         params["election_year"] = cycle
@@ -399,7 +398,6 @@ def fec_candidates_by_state(office: str, state: str, cycle: Optional[int] = None
         "state": state,
         "election_year": cycle,
         "per_page": 50,
-        "sort": "-last_file_date",
     }
     data = fec_get("/candidates/", params)
     return (data.get("results", []) or []) if data else []

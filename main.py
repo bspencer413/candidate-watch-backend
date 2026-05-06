@@ -114,7 +114,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.3.1")
+app = FastAPI(title="Candidate Watch API", version="0.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +156,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.3.1", "app": "Candidate Watch",
+            "version": "0.3.2", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -372,14 +372,22 @@ def fec_search_candidates(name: Optional[str] = None, office: str = "S",
     }
     if name:
         params["name"] = name
-    if cycle:
-        params["election_year"] = cycle
     if state:
         params["state"] = state
-    if district:
-        params["district"] = district
+    # election_year handling: pass-through if explicitly given; for nameless lookups
+    # FEC needs a year bound to return results, so default to current cycle.
+    if cycle:
+        params["election_year"] = cycle
+    elif not name:
+        params["election_year"] = current_election_cycle()
     data = fec_get("/candidates/", params)
-    return (data.get("results", []) or []) if data else []
+    results = (data.get("results", []) or []) if data else []
+    # FEC's /candidates/ endpoint does not accept district as a filter parameter.
+    # Filter client-side, zero-padded to two digits ("11" -> "11", "1" -> "01").
+    if district:
+        d = str(district).zfill(2)
+        results = [r for r in results if str(r.get("district") or "") == d]
+    return results
 
 def fec_candidate_detail(candidate_id: str, cycle: Optional[int] = None) -> dict:
     cycle = cycle or current_election_cycle()

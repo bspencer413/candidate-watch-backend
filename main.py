@@ -114,7 +114,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.3.3")
+app = FastAPI(title="Candidate Watch API", version="0.3.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +156,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.3.3", "app": "Candidate Watch",
+            "version": "0.3.4", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -459,35 +459,41 @@ def congress_cosponsored(bioguide_id: str, limit: int = 10) -> list:
                         {"limit": limit})
     return (data.get("cosponsoredLegislation") or []) if data else []
 
-def congress_current_members_by_state(state: str) -> list:
-    """All current Congress members from a given state (both chambers)."""
+def congress_current_congress_number() -> int:
+    """Current Congress number. 119th = Jan 2025 - Jan 2027. Each Congress = 2 years."""
+    year = datetime.now().year
+    # 119th Congress runs 2025-2026; 120th runs 2027-2028, etc.
+    return 119 + ((year - 2025) // 2)
+
+def congress_member_by_district(state: str, district: str) -> Optional[dict]:
+    """Direct lookup of current House member for a state+district via the dedicated endpoint."""
+    if not state or not district:
+        return None
+    cong = congress_current_congress_number()
+    d = str(district).lstrip("0") or "0"
+    data = congress_get("/member/congress/" + str(cong) + "/" + state.upper() + "/" + d, {"currentMember": "true"})
+    members = (data.get("members") or []) if data else []
+    return members[0] if members else None
+
+def congress_current_senators_for_state(state: str) -> list:
+    """Current senators from a state. Pulls state-list and filters to Senate via terms."""
     if not state:
         return []
     data = congress_get("/member/" + state.upper(), {"currentMember": "true", "limit": 50})
-    return (data.get("members") or []) if data else []
-
-def _term_chamber(t: dict) -> str:
-    """Normalize a Congress.gov term to 'H' or 'S' or ''."""
-    if not t:
-        return ""
-    ch = (t.get("chamber") or "").lower()
-    if "house" in ch:
-        return "H"
-    if "senate" in ch:
-        return "S"
-    return ""
-
-def _term_district(t: dict):
-    """Extract a normalized 2-digit district string from a term, or None."""
-    if not t:
-        return None
-    d = t.get("district")
-    if d is None:
-        return None
-    try:
-        return str(int(d)).zfill(2)
-    except Exception:
-        return None
+    members = (data.get("members") or []) if data else []
+    out = []
+    for m in members:
+        terms = m.get("terms") or {}
+        term_list = terms.get("item") if isinstance(terms, dict) else terms
+        last = None
+        if isinstance(term_list, list) and term_list:
+            last = term_list[-1]
+        elif isinstance(term_list, dict):
+            last = term_list
+        chamber = (last.get("chamber") if last else "") or ""
+        if "senate" in chamber.lower():
+            out.append(m)
+    return out
 
 # == FEC search & profile endpoints ===========================================
 
@@ -606,9 +612,8 @@ async def fec_race(office: str, state: str, district: Optional[str] = None,
 async def congress_lookup(office: str, state: str, district: Optional[str] = None):
     """Resolve an incumbent's bioguide_id from FEC office/state/district.
 
-    Senate: office=S&state=XX returns matching senators from that state (usually 2).
-    House:  office=H&state=XX&district=NN returns the rep for that district.
-    Returns the first match, or 404 if nothing matches.
+    Senate: office=S&state=XX returns the first matching current senator.
+    House:  office=H&state=XX&district=NN returns the rep for that district (direct).
     """
     if not CONGRESS_API_KEY:
         raise HTTPException(status_code=503, detail="CONGRESS_API_KEY not configured")
@@ -618,52 +623,31 @@ async def congress_lookup(office: str, state: str, district: Optional[str] = Non
     st = (state or "").upper().strip()
     if not st:
         raise HTTPException(status_code=400, detail="state required")
-    if o == "H" and not district:
-        raise HTTPException(status_code=400, detail="district required for House lookup")
-    members = congress_current_members_by_state(st)
-    target_d = str(district).zfill(2) if district else None
     chosen = None
-    for m in members:
-        # The state-listing endpoint puts chamber/district inline on the member, not under terms.
-        # Check both shapes for safety.
-        m_chamber = ""
-        m_district = None
-        # Top-level fields
-        if m.get("chamber"):
-            mc = (m.get("chamber") or "").lower()
-            if "house" in mc:
-                m_chamber = "H"
-            elif "senate" in mc:
-                m_chamber = "S"
-        if m.get("district") is not None:
-            try:
-                m_district = str(int(m.get("district"))).zfill(2)
-            except Exception:
-                pass
-        # Fallback: most-recent term
-        if not m_chamber:
-            terms = m.get("terms") or {}
-            term_list = terms.get("item") if isinstance(terms, dict) else terms
-            if term_list:
-                last = term_list[-1] if isinstance(term_list, list) else term_list
-                m_chamber = _term_chamber(last) or m_chamber
-                if m_district is None:
-                    m_district = _term_district(last)
-        if m_chamber != o:
-            continue
-        if o == "H" and target_d and m_district != target_d:
-            continue
-        chosen = m
-        break
+    if o == "H":
+        if not district:
+            raise HTTPException(status_code=400, detail="district required for House lookup")
+        chosen = congress_member_by_district(st, district)
+    else:
+        senators = congress_current_senators_for_state(st)
+        if senators:
+            chosen = senators[0]
     if not chosen:
         raise HTTPException(status_code=404, detail="no current incumbent matched")
+    # Pull a sensible district display value for the response (Senate has none)
+    out_district = None
+    if o == "H" and district:
+        try:
+            out_district = str(int(district)).zfill(2)
+        except Exception:
+            out_district = district
     return {
         "bioguide_id": chosen.get("bioguideId"),
         "name": chosen.get("name") or chosen.get("directOrderName") or chosen.get("invertedOrderName"),
         "state": chosen.get("state") or st,
         "party": chosen.get("partyName"),
         "office": o,
-        "district": target_d,
+        "district": out_district,
     }
 
 @app.get("/congress/member/{bioguide_id}")

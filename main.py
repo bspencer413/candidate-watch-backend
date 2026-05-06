@@ -114,7 +114,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.3.4")
+app = FastAPI(title="Candidate Watch API", version="0.3.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +156,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.3.4", "app": "Candidate Watch",
+            "version": "0.3.5", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -617,8 +617,13 @@ async def congress_lookup(office: str, state: str, district: Optional[str] = Non
     """
     if not CONGRESS_API_KEY:
         raise HTTPException(status_code=503, detail="CONGRESS_API_KEY not configured")
-    o = (office or "").upper()
-    if o not in ("S", "H"):
+    o_raw = (office or "").upper().strip()
+    # Accept "H"/"S" or "HOUSE"/"SENATE" -- FEC returns the full-word form
+    if o_raw in ("HOUSE", "H"):
+        o = "H"
+    elif o_raw in ("SENATE", "S"):
+        o = "S"
+    else:
         raise HTTPException(status_code=400, detail="office must be S or H")
     st = (state or "").upper().strip()
     if not st:

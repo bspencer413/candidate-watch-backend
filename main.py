@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -114,7 +114,7 @@ class WatchlistItem(BaseModel):
 
 # == App ======================================================================
 
-app = FastAPI(title="Candidate Watch API", version="0.3.5")
+app = FastAPI(title="Candidate Watch API", version="0.3.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +156,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.3.5", "app": "Candidate Watch",
+            "version": "0.3.6", "app": "Candidate Watch",
             "fec_configured": bool(FEC_API_KEY),
             "congress_configured": bool(CONGRESS_API_KEY),
             "cycle": current_election_cycle()}
@@ -881,6 +881,35 @@ async def run_cron_manually(secret: str):
 
 # Module-level scheduler -- kept in scope so it isn't garbage-collected
 _cw_scheduler = None
+
+@app.get("/admin/signup-stats")
+async def admin_signup_stats(x_admin_token: str = Header(None, alias="X-Admin-Token")):
+    """Read-only signup metrics for the 3Brains scoreboard.
+    Requires X-Admin-Token header matching ADMIN_STATS_TOKEN env var."""
+    expected = os.environ.get("ADMIN_STATS_TOKEN")
+    if not expected or x_admin_token != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM cw_users")
+        total_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM cw_users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+        signups_24h = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM cw_users WHERE created_at >= NOW() - INTERVAL '7 days'")
+        signups_7d = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM cw_users WHERE created_at >= NOW() - INTERVAL '30 days'")
+        signups_30d = c.fetchone()[0]
+        c.execute("SELECT MAX(created_at) FROM cw_users")
+        latest_row = c.fetchone()
+        latest = latest_row[0].isoformat() if latest_row and latest_row[0] else None
+        return {
+            "total_users": total_users,
+            "signups_24h": signups_24h,
+            "signups_7d": signups_7d,
+            "signups_30d": signups_30d,
+            "latest_signup_at": latest
+        }
+
 
 # == Startup ==================================================================
 

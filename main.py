@@ -229,18 +229,24 @@ async def add_to_watchlist(item: WatchlistItem, user_id: int = Depends(get_curre
         new_id = c.fetchone()[0]
         conn.commit()
 
-    # Seed snapshot from FEC if we have a fecId in the meta
-    snap = build_alert_snapshot(item.location)
-    if snap is not None:
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT INTO cw_snapshots (watchlist_id, snapshot_json, captured_at)
-                         VALUES (%s, %s, CURRENT_TIMESTAMP)
-                         ON CONFLICT (watchlist_id) DO UPDATE
-                         SET snapshot_json = EXCLUDED.snapshot_json,
-                             captured_at = CURRENT_TIMESTAMP""",
-                      (new_id, json_lib.dumps(snap)))
-            conn.commit()
+    # Seed snapshot from FEC if we have a fecId in the meta.
+    # v: guarded — the row is already saved+committed above. An FEC outage or
+    # timeout here must NOT fail the save (previously it 500'd as "Failed to
+    # save" on a candidate that was actually saved). Snapshot is best-effort.
+    try:
+        snap = build_alert_snapshot(item.location)
+        if snap is not None:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""INSERT INTO cw_snapshots (watchlist_id, snapshot_json, captured_at)
+                             VALUES (%s, %s, CURRENT_TIMESTAMP)
+                             ON CONFLICT (watchlist_id) DO UPDATE
+                             SET snapshot_json = EXCLUDED.snapshot_json,
+                                 captured_at = CURRENT_TIMESTAMP""",
+                          (new_id, json_lib.dumps(snap)))
+                conn.commit()
+    except Exception as e:
+        print("[watchlist] snapshot seed failed (save still ok):", e)
 
     return {"id": new_id, "name": item.name, "location": item.location, "dob": item.dob}
 

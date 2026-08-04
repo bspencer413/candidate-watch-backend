@@ -5,4 +5,4 @@ python-jose[cryptography]
 PyJWT
 bcrypt
 psycopg2-binary
-apscheduler
+apscheduler==3.10.4
